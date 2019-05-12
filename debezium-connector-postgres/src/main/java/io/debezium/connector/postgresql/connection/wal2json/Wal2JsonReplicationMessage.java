@@ -19,7 +19,13 @@ import io.debezium.document.Value;
 import io.debezium.util.Strings;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.errors.ConnectException;
-import org.postgresql.geometric.*;
+import org.postgresql.geometric.PGbox;
+import org.postgresql.geometric.PGcircle;
+import org.postgresql.geometric.PGline;
+import org.postgresql.geometric.PGlseg;
+import org.postgresql.geometric.PGpath;
+import org.postgresql.geometric.PGpoint;
+import org.postgresql.geometric.PGpolygon;
 import org.postgresql.jdbc.PgArray;
 import org.postgresql.util.PGInterval;
 import org.postgresql.util.PGmoney;
@@ -249,7 +255,7 @@ class Wal2JsonReplicationMessage implements ReplicationMessage {
                 return rawValue.asString();
 
             case "date":
-                return DateTimeFormat.get().date(rawValue.asString());
+                return DateParser.parsePostgresDate(rawValue.asString());
 
             case "timestamp with time zone":
             case "timestamptz":
