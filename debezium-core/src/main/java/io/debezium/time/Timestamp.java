@@ -11,6 +11,12 @@ import java.time.temporal.TemporalAdjuster;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.temporal.TemporalAdjuster;
 
 /**
  * A utility for converting various Java time representations into the signed {@link SchemaBuilder#int64() INT64} number of
@@ -69,6 +75,11 @@ public class Timestamp {
         if (value instanceof Long) {
             return (Long) value;
         }
+
+        if (value instanceof Instant) {
+            return ((Instant) value).toEpochMilli();
+        }
+
         LocalDateTime dateTime = Conversions.toLocalDateTime(value);
         if (adjuster != null) {
             dateTime = dateTime.with(adjuster);
