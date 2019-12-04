@@ -31,11 +31,12 @@ public class SqlServerDatabaseSchema extends HistorizedRelationalDatabaseSchema 
     public SqlServerDatabaseSchema(SqlServerConnectorConfig connectorConfig, SchemaNameAdjuster schemaNameAdjuster, TopicSelector<TableId> topicSelector, SqlServerConnection connection) {
         super(connectorConfig, topicSelector, connectorConfig.getTableFilters().dataCollectionFilter(), connectorConfig.getColumnFilter(),
                 new TableSchemaBuilder(
-                        new SqlServerValueConverters(connectorConfig.getDecimalMode()),
+                        new SqlServerValueConverters(connectorConfig.getDecimalMode(), connectorConfig.getTemporalPrecisionMode()),
                         schemaNameAdjuster,
-                        SourceInfo.SCHEMA
+                        connectorConfig.getSourceInfoStructMaker().schema(),
+                        connectorConfig.getSanitizeFieldNames()
                 ),
-                false);
+                false, connectorConfig.getKeyMapper());
     }
 
     @Override

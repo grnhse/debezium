@@ -19,10 +19,8 @@ import org.bson.BsonArray;
 import org.bson.BsonDocument;
 import org.bson.BsonType;
 import org.bson.BsonValue;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import io.debezium.connector.mongodb.transforms.UnwrapFromMongoDbEnvelope.ArrayEncoding;
+import io.debezium.connector.mongodb.transforms.ExtractNewDocumentState.ArrayEncoding;
 
 /**
  * MongoDataConverter handles translating MongoDB strings to Kafka Connect schemas and row data to Kafka
@@ -32,7 +30,6 @@ import io.debezium.connector.mongodb.transforms.UnwrapFromMongoDbEnvelope.ArrayE
  */
 public class MongoDataConverter {
 
-    private static final Logger LOG = LoggerFactory.getLogger(MongoDataConverter.class);
     public static final String SCHEMA_NAME_REGEX = "io.debezium.mongodb.regex";
 
     private final ArrayEncoding arrayEncoding;
@@ -217,7 +214,7 @@ public class MongoDataConverter {
             break;
 
         default:
-            break;
+            return;
         }
         struct.put(key, keyvalueforStruct.getValue().isNull() ? null : colValue);
     }

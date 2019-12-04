@@ -26,6 +26,7 @@ import org.junit.Test;
 import com.mongodb.DBRef;
 import com.mongodb.util.JSONSerializers;
 
+import io.debezium.config.Configuration;
 import io.debezium.connector.mongodb.RecordMakers.RecordsForCollection;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.data.Envelope.Operation;
@@ -52,7 +53,10 @@ public class RecordMakersTest {
     @Before
     public void beforeEach() {
         filters = new Configurator().createFilters();
-        source = new SourceInfo(SERVER_NAME);
+        source = new SourceInfo(new MongoDbConnectorConfig(
+                Configuration.create()
+                .with(MongoDbConnectorConfig.LOGICAL_NAME, SERVER_NAME)
+                .build()));
         topicSelector = MongoDbTopicSelector.defaultSelector(PREFIX, "__debezium-heartbeat");
         produced = new ArrayList<>();
         recordMakers = new RecordMakers(filters, source, topicSelector, produced::add, true);
@@ -93,8 +97,8 @@ public class RecordMakersTest {
         assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.CREATE.code());
         assertThat(value.getInt64(FieldName.TIMESTAMP)).isEqualTo(1002L);
         Struct actualSource = value.getStruct(FieldName.SOURCE);
-        Struct expectedSource = source.lastOffsetStruct("rs0", collectionId);
-        assertThat(actualSource).isEqualTo(expectedSource);
+        source.collectionEvent("rs0", collectionId);
+        assertThat(actualSource).isEqualTo(source.struct());
     }
 
     @Test
@@ -124,8 +128,8 @@ public class RecordMakersTest {
         assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.UPDATE.code());
         assertThat(value.getInt64(FieldName.TIMESTAMP)).isEqualTo(1002L);
         Struct actualSource = value.getStruct(FieldName.SOURCE);
-        Struct expectedSource = source.lastOffsetStruct("rs0", collectionId);
-        assertThat(actualSource).isEqualTo(expectedSource);
+        source.collectionEvent("rs0", collectionId);
+        assertThat(actualSource).isEqualTo(source.struct());
     }
 
     @Test
@@ -154,8 +158,8 @@ public class RecordMakersTest {
         assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.DELETE.code());
         assertThat(value.getInt64(FieldName.TIMESTAMP)).isEqualTo(1002L);
         Struct actualSource = value.getStruct(FieldName.SOURCE);
-        Struct expectedSource = source.lastOffsetStruct("rs0", collectionId);
-        assertThat(actualSource).isEqualTo(expectedSource);
+        source.collectionEvent("rs0", collectionId);
+        assertThat(actualSource).isEqualTo(source.struct());
 
         SourceRecord tombstone = produced.get(1);
         Struct key2 = (Struct) tombstone.key();
@@ -194,8 +198,8 @@ public class RecordMakersTest {
         assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.DELETE.code());
         assertThat(value.getInt64(FieldName.TIMESTAMP)).isEqualTo(1002L);
         Struct actualSource = value.getStruct(FieldName.SOURCE);
-        Struct expectedSource = source.lastOffsetStruct("rs0", collectionId);
-        assertThat(actualSource).isEqualTo(expectedSource);
+        source.collectionEvent("rs0", collectionId);
+        assertThat(actualSource).isEqualTo(source.struct());
     }
 
     @Test
@@ -311,15 +315,15 @@ public class RecordMakersTest {
         assertThat(key.get("id")).isEqualTo("{ \"$oid\" : \"" + objId + "\"}");
         assertThat(value.schema()).isSameAs(record.valueSchema());
         assertThat(value.getString(FieldName.AFTER)).isEqualTo("{"
-                    + "\"_id\" : {\"$oid\" : \"" + objId + "\"},"
-                    + "\"name\" : \"Sally\","
-                    + "\"ref\" : {\"$ref\" : \"othercollection\",\"$id\" : 15}"
+                    + "\"_id\": {\"$oid\": \"" + objId + "\"},"
+                    + "\"name\": \"Sally\","
+                    + "\"ref\": {\"$ref\": \"othercollection\",\"$id\": 15}"
                 + "}"
         );
         assertThat(value.getString(FieldName.OPERATION)).isEqualTo(Operation.CREATE.code());
         assertThat(value.getInt64(FieldName.TIMESTAMP)).isEqualTo(1002L);
         Struct actualSource = value.getStruct(FieldName.SOURCE);
-        Struct expectedSource = source.lastOffsetStruct("rs0", collectionId);
-        assertThat(actualSource).isEqualTo(expectedSource);
+        source.collectionEvent("rs0", collectionId);
+        assertThat(actualSource).isEqualTo(source.struct());
     }
 }

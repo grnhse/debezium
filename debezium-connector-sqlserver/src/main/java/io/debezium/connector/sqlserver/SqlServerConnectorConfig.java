@@ -16,6 +16,8 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.document.Document;
 import io.debezium.function.Predicates;
 import io.debezium.heartbeat.Heartbeat;
@@ -24,6 +26,7 @@ import io.debezium.relational.ColumnId;
 import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.relational.Tables.TableFilter;
 import io.debezium.relational.history.HistoryRecordComparator;
 import io.debezium.relational.history.KafkaDatabaseHistory;
@@ -189,6 +192,9 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         }
     }
 
+    public static final Field SERVER_NAME = RelationalDatabaseConnectorConfig.SERVER_NAME
+            .withValidation(CommonConnectorConfig::validateServerNameIsDifferentFromHistoryTopicName);
+
     public static final Field DATABASE_NAME = Field.create(DATABASE_CONFIG_PREFIX + JdbcConfiguration.DATABASE)
             .withDisplayName("Database name")
             .withType(Type.STRING)
@@ -223,37 +229,46 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
      * The set of {@link Field}s defined as part of this configuration.
      */
     public static Field.Set ALL_FIELDS = Field.setOf(
-            RelationalDatabaseConnectorConfig.SERVER_NAME,
+            SERVER_NAME,
             DATABASE_NAME,
             SNAPSHOT_MODE,
+            RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
             HistorizedRelationalDatabaseConnectorConfig.DATABASE_HISTORY,
             RelationalDatabaseConnectorConfig.TABLE_WHITELIST,
             RelationalDatabaseConnectorConfig.TABLE_BLACKLIST,
             RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN,
             RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST,
+            RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
+            RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE,
+            RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE,
             CommonConnectorConfig.POLL_INTERVAL_MS,
             CommonConnectorConfig.MAX_BATCH_SIZE,
             CommonConnectorConfig.MAX_QUEUE_SIZE,
             CommonConnectorConfig.SNAPSHOT_DELAY_MS,
             CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-            Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX
+            Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX,
+            CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION
     );
 
     public static ConfigDef configDef() {
         ConfigDef config = new ConfigDef();
 
-        Field.group(config, "SQL Server", RelationalDatabaseConnectorConfig.SERVER_NAME, DATABASE_NAME, SNAPSHOT_MODE);
+        Field.group(config, "SQL Server", SERVER_NAME, DATABASE_NAME, SNAPSHOT_MODE);
         Field.group(config, "History Storage", KafkaDatabaseHistory.BOOTSTRAP_SERVERS,
                 KafkaDatabaseHistory.TOPIC, KafkaDatabaseHistory.RECOVERY_POLL_ATTEMPTS,
                 KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS, HistorizedRelationalDatabaseConnectorConfig.DATABASE_HISTORY);
         Field.group(config, "Events", RelationalDatabaseConnectorConfig.TABLE_WHITELIST,
                 RelationalDatabaseConnectorConfig.TABLE_BLACKLIST,
                 RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST,
+                RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS,
+                RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
                 RelationalDatabaseConnectorConfig.TABLE_IGNORE_BUILTIN,
-                Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX
+                Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX,
+                CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION
         );
         Field.group(config, "Connector", CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE,
-                CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE);
+                CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
+                RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE, RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE);
 
         return config;
     }
@@ -261,16 +276,28 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
     private final String databaseName;
     private final SnapshotMode snapshotMode;
     private final SnapshotIsolationMode snapshotIsolationMode;
-    private final Predicate<ColumnId> columnFilter;
+    private final ColumnNameFilter columnFilter;
 
     public SqlServerConnectorConfig(Configuration config) {
-        super(config, config.getString(RelationalDatabaseConnectorConfig.SERVER_NAME), new SystemTablesPredicate(), x -> x.schema() + "." + x.table());
+        super(config, config.getString(SERVER_NAME), new SystemTablesPredicate(), x -> x.schema() + "." + x.table());
 
         this.databaseName = config.getString(DATABASE_NAME);
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SNAPSHOT_MODE.defaultValueAsString());
         this.snapshotIsolationMode = SnapshotIsolationMode.parse(config.getString(SNAPSHOT_ISOLATION_MODE), SNAPSHOT_ISOLATION_MODE.defaultValueAsString());
-        this.columnFilter = Predicates.excludes(config.getString(RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST),
-                columnId -> String.format("%s.%s.%s", columnId.schema(), columnId.table(), columnId.columnName()));
+        this.columnFilter = getColumnNameFilter(config.getString(RelationalDatabaseConnectorConfig.COLUMN_BLACKLIST));
+    }
+
+    private static ColumnNameFilter getColumnNameFilter(String excludedColumnPatterns) {
+        return new ColumnNameFilter() {
+
+            Predicate<ColumnId> delegate = Predicates.excludes(excludedColumnPatterns, ColumnId::toString);
+
+            @Override
+            public boolean matches(String catalogName, String schemaName, String tableName, String columnName) {
+                // ignore database name as it's not relevant here
+                return delegate.test(new ColumnId(new TableId(null, schemaName, tableName), columnName));
+            }
+        };
     }
 
     public String getDatabaseName() {
@@ -285,8 +312,18 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
         return snapshotMode;
     }
 
-    public Predicate<ColumnId> getColumnFilter() {
+    public ColumnNameFilter getColumnFilter() {
         return columnFilter;
+    }
+
+    @Override
+    protected SourceInfoStructMaker<? extends AbstractSourceInfo> getSourceInfoStructMaker(Version version) {
+        switch (version) {
+        case V1:
+            return new LegacyV1SqlServerSourceInfoStructMaker(Module.name(), Module.version(), this);
+        default:
+            return new SqlServerSourceInfoStructMaker(Module.name(), Module.version(), this);
+        }
     }
 
     private static class SystemTablesPredicate implements TableFilter {
@@ -309,4 +346,10 @@ public class SqlServerConnectorConfig extends HistorizedRelationalDatabaseConnec
             }
         };
     }
+
+    @Override
+    public String getContextName() {
+        return Module.contextName();
+    }
+
 }

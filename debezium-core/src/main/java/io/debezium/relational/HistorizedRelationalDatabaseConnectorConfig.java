@@ -15,6 +15,7 @@ import io.debezium.config.Field;
 import io.debezium.relational.Selectors.TableIdToStringMapper;
 import io.debezium.relational.Tables.TableFilter;
 import io.debezium.relational.history.DatabaseHistory;
+import io.debezium.relational.history.DatabaseHistoryMetrics;
 import io.debezium.relational.history.HistoryRecordComparator;
 import io.debezium.relational.history.KafkaDatabaseHistory;
 
@@ -43,11 +44,11 @@ public abstract class HistorizedRelationalDatabaseConnectorConfig extends Relati
             .withDefault(KafkaDatabaseHistory.class.getName());
 
     protected HistorizedRelationalDatabaseConnectorConfig(Configuration config, String logicalName, TableFilter systemTablesFilter) {
-        super(config, logicalName, systemTablesFilter, TableId::toString);
+        super(config, logicalName, systemTablesFilter, TableId::toString, DEFAULT_SNAPSHOT_FETCH_SIZE);
     }
 
     protected HistorizedRelationalDatabaseConnectorConfig(Configuration config, String logicalName, TableFilter systemTablesFilter, TableIdToStringMapper tableIdMapper) {
-        super(config, logicalName, systemTablesFilter, tableIdMapper);
+        super(config, logicalName, systemTablesFilter, tableIdMapper, DEFAULT_SNAPSHOT_FETCH_SIZE);
     }
 
     /**
@@ -69,7 +70,7 @@ public abstract class HistorizedRelationalDatabaseConnectorConfig extends Relati
                                               .build();
 
         HistoryRecordComparator historyComparator = getHistoryRecordComparator();
-        databaseHistory.configure(dbHistoryConfig, historyComparator); // validates
+        databaseHistory.configure(dbHistoryConfig, historyComparator, new DatabaseHistoryMetrics(this)); // validates
 
         return databaseHistory;
     }
@@ -81,8 +82,4 @@ public abstract class HistorizedRelationalDatabaseConnectorConfig extends Relati
      */
     protected abstract HistoryRecordComparator getHistoryRecordComparator();
 
-    @Override
-    protected int defaultSnapshotFetchSize(Configuration config) {
-        return DEFAULT_SNAPSHOT_FETCH_SIZE;
-    }
 }

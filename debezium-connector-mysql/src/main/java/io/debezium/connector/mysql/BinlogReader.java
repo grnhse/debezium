@@ -7,9 +7,14 @@ package io.debezium.connector.mysql;
 
 import static io.debezium.util.Strings.isNullOrEmpty;
 
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.Serializable;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.BitSet;
@@ -23,6 +28,8 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -100,6 +107,7 @@ public class BinlogReader extends AbstractReader {
     private com.github.shyiko.mysql.binlog.GtidSet gtidSet;
     private Heartbeat heartbeat;
     private MySqlJdbcContext connectionContext;
+    private final float heartbeatIntervalFactor = 0.8f;
 
     public static class BinlogPosition {
         final String filename;
@@ -201,7 +209,12 @@ public class BinlogReader extends AbstractReader {
             }
         }
         client.setKeepAlive(context.config().getBoolean(MySqlConnectorConfig.KEEP_ALIVE));
-        client.setKeepAliveInterval(context.config().getLong(MySqlConnectorConfig.KEEP_ALIVE_INTERVAL_MS));
+        final long keepAliveInterval = context.config().getLong(MySqlConnectorConfig.KEEP_ALIVE_INTERVAL_MS);
+        client.setKeepAliveInterval(keepAliveInterval);
+        //Considering heartbeatInterval should be less than keepAliveInterval, we use the heartbeatIntervalFactor
+        //multiply by keepAliveInterval and set the result value to heartbeatInterval.The default value of heartbeatIntervalFactor
+        //is 0.8, and we believe the left time (0.2 * keepAliveInterval) is enough to process the packet received from the MySQL server.
+        client.setHeartbeatInterval((long) (keepAliveInterval * heartbeatIntervalFactor));
         client.registerEventListener(context.bufferSizeForBinlogReader() == 0
                 ? this::handleEvent
                 : (new EventBuffer(context.bufferSizeForBinlogReader(), this))::add);
@@ -287,6 +300,8 @@ public class BinlogReader extends AbstractReader {
 
     @Override
     protected void doStart() {
+        context.dbSchema().assureNonEmptySchema();
+
         // Register our event handlers ...
         eventHandlers.put(EventType.STOP, this::handleServerStop);
         eventHandlers.put(EventType.HEARTBEAT, this::handleServerHeartbeat);
@@ -513,7 +528,7 @@ public class BinlogReader extends AbstractReader {
             logger.info("Error processing binlog event, and propagating to Kafka Connect so it stops this connector. Future binlog events read before connector is shutdown will be ignored.");
         } catch (InterruptedException e) {
             // Most likely because this reader was stopped and our thread was interrupted ...
-            Thread.interrupted();
+            Thread.currentThread().interrupt();
             eventHandlers.clear();
             logger.info("Stopped processing binlog events due to thread interruption");
         }
@@ -556,6 +571,7 @@ public class BinlogReader extends AbstractReader {
      */
     protected void handleServerIncident(Event event) {
         if (event.getData() instanceof EventDataDeserializationExceptionData) {
+            metrics.onErroneousEvent("source = " + event.toString());
             EventDataDeserializationExceptionData data = event.getData();
 
             EventHeaderV4 eventHeader = (EventHeaderV4) data.getCause().getEventHeader(); // safe cast, instantiated that ourselves
@@ -678,7 +694,10 @@ public class BinlogReader extends AbstractReader {
             handleTransactionCompletion(event);
             return;
         }
-        if (sql.toUpperCase().startsWith("XA ")) {
+
+        String upperCasedStatementBegin = Strings.getBegin(sql, 7).toUpperCase();
+
+        if (upperCasedStatementBegin.startsWith("XA ")) {
             // This is an XA transaction, and we currently ignore these and do nothing ...
             return;
         }
@@ -686,13 +705,16 @@ public class BinlogReader extends AbstractReader {
             logger.debug("DDL '{}' was filtered out of processing", sql);
             return;
         }
+        if (upperCasedStatementBegin.equals("INSERT ") || upperCasedStatementBegin.equals("UPDATE ") || upperCasedStatementBegin.equals("DELETE ")) {
+            throw new ConnectException("Received DML '" + sql + "' for processing, binlog probably contains events generated with statement or mixed based replication format");
+        }
         if (sql.equalsIgnoreCase("ROLLBACK")) {
             // We have hit a ROLLBACK which is not supported
             logger.warn("Rollback statements cannot be handled without binlog buffering, the connector will fail. Please check '{}' to see how to enable buffering",
                     MySqlConnectorConfig.BUFFER_SIZE_FOR_BINLOG_READER.name());
         }
-        context.dbSchema().applyDdl(context.source(), command.getDatabase(), command.getSql(), (dbName, statements) -> {
-            if (recordSchemaChangesInSourceRecords && recordMakers.schemaChanges(dbName, statements, super::enqueueRecord) > 0) {
+        context.dbSchema().applyDdl(context.source(), command.getDatabase(), command.getSql(), (dbName, tables, statements) -> {
+            if (recordSchemaChangesInSourceRecords && recordMakers.schemaChanges(dbName, tables, statements, super::enqueueRecord) > 0) {
                 logger.debug("Recorded DDL statements for database '{}': {}", dbName, statements);
             }
         });
@@ -741,6 +763,7 @@ public class BinlogReader extends AbstractReader {
      */
     private void informAboutUnknownTableIfRequired(Event event, TableId tableId, String typeToLog) {
         if (tableId != null && context.dbSchema().isTableMonitored(tableId)) {
+            metrics.onErroneousEvent("source = " + tableId + ", event " + event);
             EventHeaderV4 eventHeader = event.getHeader();
 
             if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
@@ -1067,20 +1090,40 @@ public class BinlogReader extends AbstractReader {
         return new BinlogPosition(client.getBinlogFilename(), client.getBinlogPosition());
     }
 
-    private static SSLSocketFactory getBinlogSslSocketFactory(MySqlJdbcContext connectionContext) {
+    private SSLSocketFactory getBinlogSslSocketFactory(MySqlJdbcContext connectionContext) {
         String acceptedTlsVersion = connectionContext.getSessionVariableForSslVersion();
         if (!isNullOrEmpty(acceptedTlsVersion)) {
             SSLMode sslMode = sslModeFor(connectionContext.sslMode());
 
+            // Keystore settings can be passed via system properties too so we need to read them
+            final String password = System.getProperty("javax.net.ssl.keyStorePassword");
+            final String keyFilename = System.getProperty("javax.net.ssl.keyStore");
+            KeyManager[] keyManagers = null;
+            if (keyFilename != null) {
+                final char[] passwordArray = (password == null) ? null : password.toCharArray();
+                try {
+                    KeyStore ks = KeyStore.getInstance("JKS");
+                    ks.load(new FileInputStream(keyFilename), passwordArray);
+
+                    KeyManagerFactory kmf = KeyManagerFactory.getInstance("NewSunX509");
+                    kmf.init(ks, passwordArray);
+
+                    keyManagers = kmf.getKeyManagers();
+                } catch (KeyStoreException | IOException | CertificateException | NoSuchAlgorithmException | UnrecoverableKeyException e) {
+                    throw new ConnectException("Could not load keystore", e);
+                }
+            }
+
             // DBZ-1208 Resembles the logic from the upstream BinaryLogClient, only that
             // the accepted TLS version is passed to the constructed factory
             if (sslMode == SSLMode.PREFERRED || sslMode == SSLMode.REQUIRED) {
+                final KeyManager[] finalKMS = keyManagers;
                 return new DefaultSSLSocketFactory(acceptedTlsVersion) {
 
                     @Override
                     protected void initSSLContext(SSLContext sc)
                         throws GeneralSecurityException {
-                        sc.init(null, new TrustManager[]{
+                        sc.init(finalKMS, new TrustManager[] {
                             new X509TrustManager() {
 
                                 @Override

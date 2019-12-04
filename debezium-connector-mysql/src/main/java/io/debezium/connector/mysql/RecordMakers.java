@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,7 +77,7 @@ public class RecordMakers {
                                                   .build();
         this.schemaChangeValueSchema = SchemaBuilder.struct()
                                                     .name(schemaNameAdjuster.adjust("io.debezium.connector.mysql.SchemaChangeValue"))
-                                                    .field(Fields.SOURCE, SourceInfo.SCHEMA)
+                                                    .field(Fields.SOURCE, source.schema())
                                                     .field(Fields.DATABASE_NAME, Schema.STRING_SCHEMA)
                                                     .field(Fields.DDL_STATEMENTS, Schema.STRING_SCHEMA)
                                                     .build();
@@ -131,15 +132,16 @@ public class RecordMakers {
      * Produce a schema change record for the given DDL statements.
      *
      * @param databaseName the name of the database that is affected by the DDL statements; may not be null
+     * @param tables the list of tables affected by the DDL statements
      * @param ddlStatements the DDL statements; may not be null
      * @param consumer the consumer for all produced records; may not be null
      * @return the number of records produced; will be 0 or more
      */
-    public int schemaChanges(String databaseName, String ddlStatements, BlockingConsumer<SourceRecord> consumer) {
+    public int schemaChanges(String databaseName, Set<TableId> tables, String ddlStatements, BlockingConsumer<SourceRecord> consumer) {
         String topicName = topicSelector.getPrimaryTopic();
         Integer partition = 0;
         Struct key = schemaChangeRecordKey(databaseName);
-        Struct value = schemaChangeRecordValue(databaseName, ddlStatements);
+        Struct value = schemaChangeRecordValue(databaseName, tables, ddlStatements);
         SourceRecord record = new SourceRecord(source.partition(), source.offset(),
                 topicName, partition, schemaChangeKeySchema, key, schemaChangeValueSchema, value);
         try {
@@ -225,7 +227,8 @@ public class RecordMakers {
                     Schema keySchema = tableSchema.keySchema();
                     Map<String, ?> partition = source.partition();
                     Map<String, Object> offset = source.offsetForRow(rowNumber, numberOfRows);
-                    Struct origin = source.struct(id);
+                    source.tableEvent(id);
+                    Struct origin = source.struct();
                     SourceRecord record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
                             keySchema, key, envelope.schema(), envelope.read(value, origin, ts));
                     consumer.accept(record);
@@ -238,13 +241,15 @@ public class RecordMakers {
             public int insert(SourceInfo source, Object[] row, int rowNumber, int numberOfRows, BitSet includedColumns, long ts,
                               BlockingConsumer<SourceRecord> consumer)
                     throws InterruptedException {
+                validateColumnCount(tableSchema, row);
                 Object key = tableSchema.keyFromColumnData(row);
                 Struct value = tableSchema.valueFromColumnData(row);
                 if (value != null || key != null) {
                     Schema keySchema = tableSchema.keySchema();
                     Map<String, ?> partition = source.partition();
                     Map<String, Object> offset = source.offsetForRow(rowNumber, numberOfRows);
-                    Struct origin = source.struct(id);
+                    source.tableEvent(id);
+                    Struct origin = source.struct();
                     SourceRecord record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
                             keySchema, key, envelope.schema(), envelope.create(value, origin, ts));
                     consumer.accept(record);
@@ -259,6 +264,7 @@ public class RecordMakers {
                               BlockingConsumer<SourceRecord> consumer)
                     throws InterruptedException {
                 int count = 0;
+                validateColumnCount(tableSchema, after);
                 Object key = tableSchema.keyFromColumnData(after);
                 Struct valueAfter = tableSchema.valueFromColumnData(after);
                 if (valueAfter != null || key != null) {
@@ -267,7 +273,8 @@ public class RecordMakers {
                     Schema keySchema = tableSchema.keySchema();
                     Map<String, ?> partition = source.partition();
                     Map<String, Object> offset = source.offsetForRow(rowNumber, numberOfRows);
-                    Struct origin = source.struct(id);
+                    source.tableEvent(id);
+                    Struct origin = source.struct();
                     if (key != null && !Objects.equals(key, oldKey)) {
                         // The key has changed, so we need to deal with both the new key and old key.
                         // Consumers may push the events into a system that won't allow both records to exist at the same time,
@@ -305,13 +312,15 @@ public class RecordMakers {
                               BlockingConsumer<SourceRecord> consumer)
                     throws InterruptedException {
                 int count = 0;
+                validateColumnCount(tableSchema, row);
                 Object key = tableSchema.keyFromColumnData(row);
                 Struct value = tableSchema.valueFromColumnData(row);
                 if (value != null || key != null) {
                     Schema keySchema = tableSchema.keySchema();
                     Map<String, ?> partition = source.partition();
                     Map<String, Object> offset = source.offsetForRow(rowNumber, numberOfRows);
-                    Struct origin = source.struct(id);
+                    source.tableEvent(id);
+                    Struct origin = source.struct();
                     // Send a delete message ...
                     SourceRecord record = new SourceRecord(partition, getSourceRecordOffset(offset), topicName, partitionNum,
                             keySchema, key, envelope.schema(), envelope.delete(value, origin, ts));
@@ -334,6 +343,13 @@ public class RecordMakers {
                 return "RecordMaker.Converter(" + id + ")";
             }
 
+            private void validateColumnCount(TableSchema tableSchema, Object[] row) {
+                final int expectedColumnsCount = schema.tableFor(tableSchema.id()).columns().size();
+                if (expectedColumnsCount != row.length) {
+                    logger.error("Invalid number of columns, expected '{}' arrived '{}'", expectedColumnsCount, row.length);
+                    throw new ConnectException("The binlog event does not contain expected number of columns; the internal schema representation is probably out of sync with the real database schema, or the binlog contains events recorded with binlog_row_image other than FULL or the table in question is an NDB table");
+                }
+            }
         };
 
         convertersByTableNumber.put(tableNumber, converter);
@@ -352,7 +368,9 @@ public class RecordMakers {
         return result;
     }
 
-    protected Struct schemaChangeRecordValue(String databaseName, String ddlStatements) {
+    protected Struct schemaChangeRecordValue(String databaseName, Set<TableId> tables, String ddlStatements) {
+        source.databaseEvent(databaseName);
+        source.tableEvent(tables);
         Struct result = new Struct(schemaChangeValueSchema);
         result.put(Fields.SOURCE, source.struct());
         result.put(Fields.DATABASE_NAME, databaseName);

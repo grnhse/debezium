@@ -17,11 +17,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.postgresql.TypeRegistry;
-import io.debezium.connector.postgresql.connection.MessageDecoder;
+import io.debezium.connector.postgresql.connection.AbstractMessageDecoder;
 import io.debezium.connector.postgresql.connection.ReplicationStream.ReplicationMessageProcessor;
 import io.debezium.document.Document;
 import io.debezium.document.DocumentReader;
-import io.debezium.time.Conversions;
 
 /**
  * <p>JSON deserialization of a message sent by
@@ -78,7 +77,7 @@ import io.debezium.time.Conversions;
  * @author Jiri Pechanec
  *
  */
-public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
+public class StreamingWal2JsonMessageDecoder extends AbstractMessageDecoder {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(StreamingWal2JsonMessageDecoder.class);
 
@@ -91,7 +90,6 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
     private static final byte LEFT_BRACE = 123;
     private static final byte RIGHT_BRACE = 125;
     private static final long UNDEFINED_LONG = -1;
-    private static final String UNDEFINED_STRING = "undefined";
 
     private final DateTimeFormat dateTime = DateTimeFormat.get();
     private boolean containsMetadata = false;
@@ -104,8 +102,6 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
     private byte[] currentChunk;
 
     private long txId;
-
-    private String timestamp;
 
     private Instant commitTime;
 
@@ -148,8 +144,8 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
                     else {
                         // Correct initial chunk
                         txId = message.getLong("xid");
-                        timestamp = message.getString("timestamp");
-                        commitTime = Conversions.toInstant(dateTime.systemTimestamp(timestamp));
+                        final String timestamp = message.getString("timestamp");
+                        commitTime = dateTime.systemTimestampToInstant(timestamp);
                         messageInProgress = true;
                         currentChunk = null;
                     }
@@ -190,6 +186,16 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
         }
     }
 
+    /**
+     * This method is called when a database server or Debezium crashes.
+     * With wal2json streaming mode it can happen that the message preamble is no replayed
+     * but the message is streamed form the middle.
+     * This issue is very hard to reproduce so a precaution is taken and metadata are filled with
+     * synthetic values.
+     * <p>The new wal2json format will be resilient to this situation.
+     *
+     * @param content
+     */
     protected void outOfOrderChunk(final byte[] content) {
         // This is not a standalone JSON, we are getting a transaction in progress
         // Metadata are lost, we need to create artificial ones
@@ -197,8 +203,7 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
             LOGGER.warn("Got out of order chunk {}, recording artifical TX", new String(content));
         }
         txId = UNDEFINED_LONG;
-        timestamp = UNDEFINED_STRING;
-        commitTime = null;
+        commitTime = Instant.now();
         messageInProgress = true;
         currentChunk = null;
     }
@@ -264,11 +269,6 @@ public class StreamingWal2JsonMessageDecoder implements MessageDecoder {
             .withSlotOption("write-in-chunks", 1)
             .withSlotOption("include-xids", 1)
             .withSlotOption("include-timestamp", 1);
-    }
-
-    @Override
-    public ChainedLogicalStreamBuilder tryOnceOptions(ChainedLogicalStreamBuilder builder) {
-        return builder.withSlotOption("include-unchanged-toast", 0);
     }
 
     @Override

@@ -58,7 +58,10 @@ public class KafkaDatabaseHistoryTest {
                                   .deleteDataPriorToStartup(true)
                                   .deleteDataUponShutdown(true)
                                   .addBrokers(1)
-                                  .withKafkaConfiguration(Collect.propertiesOf("auto.create.topics.enable", "false"))
+                                  .withKafkaConfiguration(Collect.propertiesOf(
+                                          "auto.create.topics.enable", "false",
+                                          "zookeeper.session.timeout.ms", "20000"
+                                  ))
                                   .startup();
         history = new KafkaDatabaseHistory();
     }
@@ -106,7 +109,7 @@ public class KafkaDatabaseHistoryTest {
                                                   50000)
                                             .with(KafkaDatabaseHistory.SKIP_UNPARSEABLE_DDL_STATEMENTS, skipUnparseableDDL)
                                             .build();
-        history.configure(config, null);
+        history.configure(config, null, DatabaseHistoryMetrics.NOOP);
         history.start();
 
         // Should be able to call start more than once ...
@@ -165,7 +168,7 @@ public class KafkaDatabaseHistoryTest {
         // Stop the history (which should stop the producer) ...
         history.stop();
         history = new KafkaDatabaseHistory();
-        history.configure(config, null);
+        history.configure(config, null, DatabaseHistoryListener.NOOP);
         // no need to start
 
         // Recover from the very beginning to just past the first change ...
@@ -282,7 +285,7 @@ public class KafkaDatabaseHistoryTest {
                 .with(KafkaDatabaseHistory.SKIP_UNPARSEABLE_DDL_STATEMENTS, true)
                 .build();
 
-        history.configure(config, null);
+        history.configure(config, null, DatabaseHistoryMetrics.NOOP);
         history.start();
 
         // dummytopic should not exist yet

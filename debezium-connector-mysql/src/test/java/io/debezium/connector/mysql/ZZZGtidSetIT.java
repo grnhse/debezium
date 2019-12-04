@@ -59,8 +59,8 @@ public class ZZZGtidSetIT extends AbstractConnectorTest {
     }
 
     private boolean isGtidModeEnabled() throws SQLException {
-        try (MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());) {
-            return MySQLConnection.forTestDatabase(DATABASE.getDatabaseName()).queryAndMap(
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName())) {
+            return db.queryAndMap(
                     "SHOW GLOBAL VARIABLES LIKE 'GTID_MODE'",
                     rs -> {
                         if (rs.next()) {
@@ -81,12 +81,7 @@ public class ZZZGtidSetIT extends AbstractConnectorTest {
             return;
         }
 
-        try (MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());) {
-            try (JdbcConnection connection = db.connect()) {
-                connection.execute("FLUSH LOGS");
-                connection.execute("PURGE BINARY LOGS TO 'mysql-bin.000004'");
-            }
-        }
+        purgeDatabaseLogs();
         final UniqueDatabase database = new UniqueDatabase("myServer1", "connector_test")
                 .withDbHistoryPath(DB_HISTORY_PATH);
         final UniqueDatabase ro_database = new UniqueDatabase("myServer2", "connector_test_ro", database)
@@ -122,6 +117,111 @@ public class ZZZGtidSetIT extends AbstractConnectorTest {
             Assertions.assertThat(m.group(2)).isNotEqualTo("1");
         });
 
+        stopConnector();
+    }
+
+    private void purgeDatabaseLogs() throws SQLException {
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());) {
+            try (JdbcConnection connection = db.connect()) {
+                connection.execute(
+                        "FLUSH LOGS"
+                );
+                final String lastBinlogName = connection.queryAndMap("SHOW BINARY LOGS", rs -> {
+                    String binlog = null;
+                    while (rs.next()) {
+                        binlog = rs.getString(1);
+                    }
+                    return binlog;
+                });
+                connection.execute(
+                        "PURGE BINARY LOGS TO '" + lastBinlogName + "'"
+                );
+            }
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1244")
+    public void shouldProcessPurgedLogsWhenDownAndSnapshotNeeded() throws SQLException, InterruptedException {
+        Testing.Files.delete(DB_HISTORY_PATH);
+
+        if (!isGtidModeEnabled()) {
+            logger.warn("GTID is not enabled, skipping shouldProcessPurgedLogsWhenDownAndSnapshotNeeded");
+            return;
+        }
+
+        purgeDatabaseLogs();
+        final UniqueDatabase database = new UniqueDatabase("myServer1", "connector_test")
+                .withDbHistoryPath(DB_HISTORY_PATH);
+        database.createAndInitialize();
+
+        // Use the DB configuration to define the connector's configuration ...
+        config = database.defaultConfig()
+                              .with(MySqlConnectorConfig.SNAPSHOT_MODE, SnapshotMode.WHEN_NEEDED)
+                              .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, true)
+                              .with(MySqlConnectorConfig.TABLE_WHITELIST, database.qualifiedTableName("customers"))
+                              .build();
+
+        // Start the connector ...
+        start(MySqlConnector.class, config);
+
+        // Consume the first records due to startup and initialization of the database ...
+        // Testing.Print.enable();
+        SourceRecords records = consumeRecordsByTopic(1 + 3 + 2 * 4 + 4); // SET + DROP/CREATE/USE DB + DROP/CREATE 4 tables + 4 data
+        assertThat(records.recordsForTopic(database.topicForTable("customers")).size()).isEqualTo(4);
+        assertThat(records.topics().size()).isEqualTo(1 + 1);
+        assertThat(records.ddlRecordsForDatabase(database.getDatabaseName()).size()).isEqualTo(11);
+
+        // Check that all records are valid, can be serialized and deserialized ...
+        records.forEach(this::validate);
+
+        stopConnector();
+
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(database.getDatabaseName())) {
+            db.execute(
+                    "INSERT INTO customers VALUES(default,1,1,1)",
+                    "INSERT INTO customers VALUES(default,2,2,2)"
+            );
+        }
+
+        start(MySqlConnector.class, config);
+        records = consumeRecordsByTopic(2);
+        stopConnector();
+
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(database.getDatabaseName())) {
+            db.execute(
+                    "INSERT INTO customers VALUES(default,3,3,3)",
+                    "INSERT INTO customers VALUES(default,4,4,4)"
+            );
+        }
+        purgeDatabaseLogs();
+        start(MySqlConnector.class, config);
+        // SET + DROP/CREATE/USE DB + DROP/CREATE 4 tables + 8 data
+        records = consumeRecordsByTopic(1 + 3 + 2 * 4 + 8);
+        assertThat(records.recordsForTopic(database.topicForTable("customers")).size()).isEqualTo(8);
+        assertThat(records.topics().size()).isEqualTo(1 + 1);
+        assertThat(records.ddlRecordsForDatabase(database.getDatabaseName()).size()).isEqualTo(11);
+        stopConnector();
+
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(database.getDatabaseName())) {
+            db.execute(
+                    "INSERT INTO customers VALUES(default,5,5,5)",
+                    "INSERT INTO customers VALUES(default,6,6,6)"
+            );
+        }
+        purgeDatabaseLogs();
+        try (MySQLConnection db = MySQLConnection.forTestDatabase(database.getDatabaseName())) {
+            db.execute(
+                    "INSERT INTO customers VALUES(default,7,7,7)",
+                    "INSERT INTO customers VALUES(default,8,8,8)"
+            );
+        }
+        start(MySqlConnector.class, config);
+        // SET + DROP/CREATE/USE DB + DROP/CREATE 4 tables + 8 data
+        records = consumeRecordsByTopic(1 + 3 + 2 * 4 + 12);
+        assertThat(records.recordsForTopic(database.topicForTable("customers")).size()).isEqualTo(12);
+        assertThat(records.topics().size()).isEqualTo(1 + 1);
+        assertThat(records.ddlRecordsForDatabase(database.getDatabaseName()).size()).isEqualTo(11);
         stopConnector();
     }
 }

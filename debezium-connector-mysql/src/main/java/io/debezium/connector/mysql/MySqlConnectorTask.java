@@ -63,7 +63,7 @@ public final class MySqlConnectorTask extends BaseSourceTask {
     @Override
     public synchronized void start(Configuration config) {
         final String serverName = config.getString(MySqlConnectorConfig.SERVER_NAME);
-        PreviousContext prevLoggingContext = LoggingContext.forConnector("MySQL", serverName, "task");
+        PreviousContext prevLoggingContext = LoggingContext.forConnector(Module.contextName(), serverName, "task");
 
         try {
             // Get the offsets for our partition ...
@@ -211,7 +211,7 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                 }
                 if (!rowBinlogEnabled) {
                     throw new ConnectException(
-                            "The MySQL server does not appear to be using a row-level binlog, which is required for this connector to work properly. Enable this mode and restart the connector.");
+                            "The MySQL server does not appear to be using a full row-level binlog, which is required for this connector to work properly. Enable this mode and restart the connector.");
                 }
 
 
@@ -266,7 +266,7 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                 logger.error("Failed to start the connector (see other exception), but got this error while cleaning up", s);
             }
             if (e instanceof InterruptedException) {
-                Thread.interrupted();
+                Thread.currentThread().interrupt();
                 throw new ConnectException("Interrupted while starting the connector", e);
             }
             if (e instanceof ConnectException) {
@@ -491,6 +491,15 @@ public final class MySqlConnectorTask extends BaseSourceTask {
             GtidSet availableGtidSet = new GtidSet(availableGtidStr);
             if (gtidSet.isContainedWithin(availableGtidSet)) {
                 logger.info("MySQL current GTID set {} does contain the GTID set required by the connector {}", availableGtidSet, gtidSet);
+                final GtidSet knownServerSet = availableGtidSet.retainAll(taskContext.gtidSourceFilter());
+                final GtidSet gtidSetToReplicate = connectionContext.subtractGtidSet(knownServerSet, gtidSet);
+                final GtidSet purgedGtidSet = connectionContext.purgedGtidSet();
+                final GtidSet nonPurgedGtidSetToReplicate = connectionContext.subtractGtidSet(gtidSetToReplicate, purgedGtidSet);
+                logger.info("GTIDs known by the server but not processed yet {}, for replication are available only {}", gtidSetToReplicate, nonPurgedGtidSetToReplicate);
+                if (!gtidSetToReplicate.equals(nonPurgedGtidSetToReplicate)) {
+                    logger.info("Some of the GTIDs needed to replicate have been already purged");
+                    return false;
+                }
                 return true;
             }
             logger.info("Connector last known GTIDs are {}, but MySQL has {}", gtidSet, availableGtidSet);
@@ -576,6 +585,19 @@ public final class MySqlConnectorTask extends BaseSourceTask {
         }
 
         logger.debug("binlog_format={}", mode.get());
-        return "ROW".equalsIgnoreCase(mode.get());
+
+        AtomicReference<String> rowImage = new AtomicReference<String>("");
+        try {
+            connectionContext.jdbc().query("SHOW GLOBAL VARIABLES LIKE 'binlog_row_image'", rs -> {
+                if (rs.next()) {
+                    rowImage.set(rs.getString(2));
+                }
+            });
+        } catch (SQLException e) {
+            throw new ConnectException("Unexpected error while connecting to MySQL and looking at BINLOG row image mode: ", e);
+        }
+
+        logger.debug("binlog_row_image={}", rowImage.get());
+        return "ROW".equalsIgnoreCase(mode.get()) && "FULL".equalsIgnoreCase(rowImage.get());
     }
 }

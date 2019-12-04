@@ -7,6 +7,8 @@
 package io.debezium.connector.postgresql;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -15,28 +17,32 @@ import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigValue;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.connector.postgresql.connection.MessageDecoder;
+import io.debezium.connector.postgresql.connection.MessageDecoderConfig;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.connector.postgresql.connection.pgoutput.PgOutputMessageDecoder;
 import io.debezium.connector.postgresql.connection.pgproto.PgProtoMessageDecoder;
 import io.debezium.connector.postgresql.connection.wal2json.NonStreamingWal2JsonMessageDecoder;
 import io.debezium.connector.postgresql.connection.wal2json.StreamingWal2JsonMessageDecoder;
 import io.debezium.connector.postgresql.snapshot.AlwaysSnapshotter;
+import io.debezium.connector.postgresql.snapshot.ExportedSnapshotter;
 import io.debezium.connector.postgresql.snapshot.InitialOnlySnapshotter;
 import io.debezium.connector.postgresql.snapshot.InitialSnapshotter;
 import io.debezium.connector.postgresql.snapshot.NeverSnapshotter;
 import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConfiguration;
-import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.TableFilter;
+import io.debezium.util.Strings;
 
 /**
  * The configuration properties for the {@link PostgresConnector}
@@ -131,6 +137,11 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
          * Perform a snapshot and then stop before attempting to receive any logical changes.
          */
         INITIAL_ONLY("initial_only", (c) -> new InitialOnlySnapshotter()),
+
+        /**
+         * Perform an exported snapshot
+         */
+        EXPORTED("exported", (c) -> new ExportedSnapshotter()),
 
         /**
          * Inject a custom snapshotter, which allows for more control over snapshots.
@@ -278,68 +289,21 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         }
     }
 
-    /**
-     * The set of configuration options for how events are placed on Kafka topics
-     */
-    public enum TopicSelectionStrategy implements EnumeratedValue {
-        /**
-         * Create a topic for each distinct DB table
-         */
-        TOPIC_PER_TABLE("topic_per_table") {
+    public enum LogicalDecoder implements EnumeratedValue {
+        PGOUTPUT("pgoutput") {
+            @Override
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
+                return new PgOutputMessageDecoder(config);
+            }
 
             @Override
-            public String getTopicName(TableId tableId, String prefix, String delimiter) {
-                return String.join(delimiter, prefix, tableId.schema(), tableId.table());
+            public String getPostgresPluginName() {
+                return getValue();
             }
         },
-
-        /**
-         * Create a topic for an entire DB schema
-         */
-        TOPIC_PER_SCHEMA("topic_per_schema") {
-
-            @Override
-            public String getTopicName(TableId tableId, String prefix, String delimiter) {
-                return String.join(delimiter, prefix, tableId.schema());
-            }
-        };
-
-        private String value;
-
-        @Override
-        public String getValue() {
-            return value;
-        }
-
-        public abstract String getTopicName(TableId tableId, String prefix, String delimiter);
-
-        TopicSelectionStrategy(String value) {
-            this.value = value;
-        }
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @return the matching option, or null if no match is found
-         */
-        public static TopicSelectionStrategy parse(String value) {
-            if (value == null) {
-                return null;
-            }
-            value = value.trim();
-            for (TopicSelectionStrategy option : TopicSelectionStrategy.values()) {
-                if (option.getValue().equalsIgnoreCase(value)) {
-                    return option;
-                }
-            }
-            return null;
-        }
-    }
-
-    public enum LogicalDecoder implements EnumeratedValue {
         DECODERBUFS("decoderbufs") {
             @Override
-            public MessageDecoder messageDecoder() {
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
                 return new PgProtoMessageDecoder();
             }
 
@@ -350,18 +314,23 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         },
         WAL2JSON_STREAMING("wal2json_streaming") {
             @Override
-            public MessageDecoder messageDecoder() {
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
                 return new StreamingWal2JsonMessageDecoder();
             }
 
             @Override
             public String getPostgresPluginName() {
                 return "wal2json";
+            }
+
+            @Override
+            public boolean hasUnchangedToastColumnMarker() {
+                return false;
             }
         },
         WAL2JSON_RDS_STREAMING("wal2json_rds_streaming") {
             @Override
-            public MessageDecoder messageDecoder() {
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
                 return new StreamingWal2JsonMessageDecoder();
             }
 
@@ -374,10 +343,15 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             public String getPostgresPluginName() {
                 return "wal2json";
             }
+
+            @Override
+            public boolean hasUnchangedToastColumnMarker() {
+                return false;
+            }
         },
         WAL2JSON("wal2json") {
             @Override
-            public MessageDecoder messageDecoder() {
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
                 return new NonStreamingWal2JsonMessageDecoder();
             }
 
@@ -385,10 +359,15 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             public String getPostgresPluginName() {
                 return "wal2json";
             }
+
+            @Override
+            public boolean hasUnchangedToastColumnMarker() {
+                return false;
+            }
         },
         WAL2JSON_RDS("wal2json_rds") {
             @Override
-            public MessageDecoder messageDecoder() {
+            public MessageDecoder messageDecoder(MessageDecoderConfig config) {
                 return new NonStreamingWal2JsonMessageDecoder();
             }
 
@@ -400,6 +379,11 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             @Override
             public String getPostgresPluginName() {
                 return "wal2json";
+            }
+
+            @Override
+            public boolean hasUnchangedToastColumnMarker() {
+                return false;
             }
         };
 
@@ -409,10 +393,14 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
             this.decoderName = decoderName;
         }
 
-        public abstract MessageDecoder messageDecoder();
+        public abstract MessageDecoder messageDecoder(MessageDecoderConfig config);
 
         public boolean forceRds() {
             return false;
+        }
+
+        public boolean hasUnchangedToastColumnMarker() {
+            return true;
         }
 
         public static LogicalDecoder parse(String s) {
@@ -478,12 +466,12 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         }
     }
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(PostgresConnectorConfig.class);
-
     protected static final String DATABASE_CONFIG_PREFIX = "database.";
     protected static final int DEFAULT_PORT = 5_432;
     protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 10_240;
     protected static final long DEFAULT_SNAPSHOT_LOCK_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
+    protected static final int DEFAULT_MAX_RETRIES = 6;
+    protected static final Duration DEFAULT_RETRY_DELAY = Duration.ofSeconds(10);
 
     private static final String TABLE_WHITELIST_NAME = "table.whitelist";
 
@@ -514,6 +502,15 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                                 "Whether or not to drop the logical replication slot when the connector finishes orderly" +
                                                                 "By default the replication is kept so that on restart progress can resume from the last recorded location");
 
+    public static final Field PUBLICATION_NAME = Field.create("publication.name")
+                                                      .withDisplayName("Publication")
+                                                      .withType(Type.STRING)
+                                                      .withWidth(Width.MEDIUM)
+                                                      .withImportance(Importance.MEDIUM)
+                                                      .withDefault(ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME)
+                                                      .withDescription("The name of the Postgres 10+ publication used for streaming changes from a plugin." +
+                                                                       "Defaults to '" + ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME + "'");
+
     public static final Field STREAM_PARAMS = Field.create("slot.stream.params")
                                                         .withDisplayName("Optional parameters to pass to the logical decoder when the stream is started.")
                                                         .withType(Type.STRING)
@@ -521,6 +518,22 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                         .withImportance(Importance.LOW)
                                                         .withDescription(
                                                                 "Any optional parameters used by logical decoding plugin. Semi-colon separated. E.g. 'add-tables=public.table,public.table2;include-lsn=true'");
+
+    public static final Field MAX_RETRIES = Field.create("slot.max.retries")
+            .withDisplayName("Retry count")
+            .withType(Type.INT)
+            .withImportance(Importance.LOW)
+            .withDefault(DEFAULT_MAX_RETRIES)
+            .withValidation(Field::isInteger)
+            .withDescription("How many times to retry connecting to a replication slot when an attempt fails.");
+
+    public static final Field RETRY_DELAY_MS = Field.create("slot.retry.delay.ms")
+            .withDisplayName("Retry delay")
+            .withType(Type.LONG)
+            .withImportance(Importance.LOW)
+            .withDefault(DEFAULT_RETRY_DELAY.toMillis())
+            .withValidation(Field::isInteger)
+            .withDescription("The number of milli-seconds to wait between retry attempts when the connector fails to connect to a replication slot.");
 
     public static final Field HOSTNAME = Field.create(DATABASE_CONFIG_PREFIX + JdbcConfiguration.HOSTNAME)
                                               .withDisplayName("Hostname")
@@ -572,27 +585,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                                    + "of session parameters only, but not for executing DML statements. Use doubled semicolon (';;') to use a semicolon as a character "
                                                                    + "and not as a delimiter.");
 
-    public static final Field TOPIC_SELECTION_STRATEGY = Field.create("topic.selection.strategy")
-                                                              .withDisplayName("Topic selection strategy")
-                                                              .withEnum(TopicSelectionStrategy.class, TopicSelectionStrategy.TOPIC_PER_TABLE)
-                                                              .withWidth(Width.MEDIUM)
-                                                              .withImportance(Importance.LOW)
-                                                              .withDescription("How events received from the DB should be placed on topics. Options include"
-                                                      + "'table' (the default) each DB table will have a separate Kafka topic; "
-                                                      + "'schema' there will be one Kafka topic per DB schema; events from multiple topics belonging to the same schema will be placed on the same topic");
-
-    /**
-     * @deprecated use {@link CommonConnectorConfig#SNAPSHOT_FETCH_SIZE} instead of
-     */
-    @Deprecated
-    public static final Field ROWS_FETCH_SIZE = Field.create("rows.fetch.size")
-                                                     .withDisplayName("Result set fetch size")
-                                                     .withType(Type.INT)
-                                                     .withWidth(Width.MEDIUM)
-                                                     .withImportance(Importance.MEDIUM)
-                                                     .withDescription("The maximum number of DB rows that should be loaded into memory while performing a snapshot")
-                                                     .withValidation(Field::isPositiveLong);
-
     public static final Field SSL_MODE = Field.create(DATABASE_CONFIG_PREFIX + "sslmode")
                                               .withDisplayName("SSL mode")
                                               .withEnum(SecureConnectionMode.class, SecureConnectionMode.DISABLED)
@@ -639,32 +631,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                         .withWidth(Width.LONG)
                                                         .withImportance(Importance.MEDIUM)
                                                         .withDescription("A name of class to that creates SSL Sockets. Use org.postgresql.ssl.NonValidatingFactory to disable SSL validation in development environments");
-
-    /**
-     * A comma-separated list of regular expressions that match schema names to be monitored.
-     * May not be used with {@link #SCHEMA_BLACKLIST}.
-     */
-    public static final Field SCHEMA_WHITELIST = Field.create("schema.whitelist")
-                                                      .withDisplayName("Schemas")
-                                                      .withType(Type.LIST)
-                                                      .withWidth(Width.LONG)
-                                                      .withImportance(Importance.HIGH)
-                                                      .withDependents(TABLE_WHITELIST_NAME)
-                                                      .withDescription("The schemas for which events should be captured");
-
-    /**
-     * A comma-separated list of regular expressions that match schema names to be excluded from monitoring.
-     * May not be used with {@link #SCHEMA_WHITELIST}.
-     */
-    public static final Field SCHEMA_BLACKLIST = Field.create("schema.blacklist")
-                                                      .withDisplayName("Exclude Schemas")
-                                                      .withType(Type.STRING)
-                                                      .withWidth(Width.LONG)
-                                                      .withImportance(Importance.MEDIUM)
-                                                      .withValidation(PostgresConnectorConfig::validateSchemaBlacklist)
-                                                      .withInvisibleRecommender()
-                                                      .withDescription("");
-
 
     /**
      * A comma-separated list of regular expressions that match the fully-qualified names of tables to be monitored.
@@ -715,6 +681,7 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                            + "'initial' (the default) to specify the connector can run a snapshot only when no offsets are available for the logical server name; "
                                                            + "'initial_only' same as 'initial' except the connector should stop after completing the snapshot and before it would normally start emitting changes;"
                                                            + "'never' to specify the connector should never run a snapshot and that upon first startup the connector should read from the last position (LSN) recorded by the server; and"
+                                                           + "'exported' to specify the connector should run a snapshot based on the position when the replication slot was created; "
                                                            + "'custom' to specify a custom class with 'snapshot.custom_class' which will be loaded and used to determine the snapshot, see docs for more details.");
 
     public static final Field SNAPSHOT_MODE_CLASS = Field.create("snapshot.custom.class")
@@ -740,17 +707,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                               .withDefault(DEFAULT_SNAPSHOT_LOCK_TIMEOUT_MILLIS)
                                                               .withDescription("The maximum number of millis to wait for table locks at the beginning of a snapshot. If locks cannot be acquired in this " +
                                                                                "time frame, the snapshot will be aborted. Defaults to 10 seconds");
-
-    public static final Field TIME_PRECISION_MODE = Field.create("time.precision.mode")
-                                                         .withDisplayName("Time Precision")
-                                                         .withEnum(TemporalPrecisionMode.class, TemporalPrecisionMode.ADAPTIVE)
-                                                         .withWidth(Width.SHORT)
-                                                         .withImportance(Importance.MEDIUM)
-                                                         .withDescription("Time, date, and timestamps can be represented with different kinds of precisions, including:"
-                                                                 + "'adaptive' (the default) bases the precision of time, date, and timestamp values on the database column's precision; "
-                                                                 + "'adaptive_time_microseconds' like 'adaptive' mode, but TIME fields always use microseconds precision;"
-                                                                 + "'connect' always represents time, date, and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
-                                                                 + "which uses millisecond precision regardless of the database columns' precision .");
 
     public static final Field HSTORE_HANDLING_MODE = Field.create("hstore.handling.mode")
                                                           .withDisplayName("HStore Handling")
@@ -789,17 +745,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                                     + "'false' (the default) omits the fields; "
                                                                     + "'true' converts the field into an implementation dependent binary representation.");
 
-    public static final Field SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE = Field.create("snapshot.select.statement.overrides")
-                                                            .withDisplayName("List of tables where the default select statement used during snapshotting should be overridden.")
-                                                            .withType(Type.STRING)
-                                                            .withWidth(Width.LONG)
-                                                            .withImportance(Importance.MEDIUM)
-                                                            .withDescription(" This property contains a comma-separated list of fully-qualified tables (DB_NAME.TABLE_NAME). Select statements for the individual tables are " +
-                                                                    "specified in further configuration properties, one for each table, identified by the id 'snapshot.select.statement.overrides.[DB_NAME].[TABLE_NAME]'. " +
-                                                                    "The value of those properties is the select statement to use when retrieving data from the specific table during snapshotting. " +
-                                                                    "A possible use case for large append-only tables is setting a specific point where to start (resume) snapshotting, in case a previous snapshotting was interrupted.");
-
-
     public static final Field SCHEMA_REFRESH_MODE = Field.create("schema.refresh.mode")
             .withDisplayName("Schema refresh mode")
             .withEnum(SchemaRefreshMode.class, SchemaRefreshMode.COLUMNS_DIFF)
@@ -826,26 +771,36 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
                     "The bigger the value, the less likely this value is to be the current 'true' value, but the lower the performance penalty. " +
                     "The default is set to 0 ms, which disables tracking xmin.")
             .withValidation(Field::isNonNegativeLong);
+
+    public static final Field TOASTED_VALUE_PLACEHOLDER = Field.create("toasted.value.placeholder")
+            .withDisplayName("Toasted value placeholder")
+            .withType(Type.STRING)
+            .withWidth(Width.MEDIUM)
+            .withDefault("__debezium_unavailable_value")
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Specify the constant that will be provided by Debezium to indicate that " +
+                    "the original value is a toasted value not provided by the database." + 
+                    "If starts with 'hex:' prefix it is expected that the rest of the string repesents hexadecimally encoded octets.");
+
     /**
      * The set of {@link Field}s defined as part of this configuration.
      */
-    public static Field.Set ALL_FIELDS = Field.setOf(PLUGIN_NAME, SLOT_NAME, DROP_SLOT_ON_STOP, STREAM_PARAMS,
+    public static Field.Set ALL_FIELDS = Field.setOf(PLUGIN_NAME, SLOT_NAME, DROP_SLOT_ON_STOP, PUBLICATION_NAME, STREAM_PARAMS, MAX_RETRIES, RETRY_DELAY_MS,
                                                      DATABASE_NAME, USER, PASSWORD, HOSTNAME, PORT, ON_CONNECT_STATEMENTS, RelationalDatabaseConnectorConfig.SERVER_NAME,
-                                                     TOPIC_SELECTION_STRATEGY, CommonConnectorConfig.MAX_BATCH_SIZE,
+                                                     CommonConnectorConfig.MAX_BATCH_SIZE,
                                                      CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.POLL_INTERVAL_MS,
                                                      CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
                                                      Heartbeat.HEARTBEAT_INTERVAL,
                                                      Heartbeat.HEARTBEAT_TOPICS_PREFIX,
                                                      SCHEMA_WHITELIST,
-                                                     SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
+                                                     SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST, MSG_KEY_COLUMNS,
                                                      COLUMN_BLACKLIST, SNAPSHOT_MODE, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE,
                                                      SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD,
-                                                     SSL_ROOT_CERT, SSL_CLIENT_KEY, SNAPSHOT_LOCK_TIMEOUT_MS, ROWS_FETCH_SIZE, SSL_SOCKET_FACTORY,
+                                                     SSL_ROOT_CERT, SSL_CLIENT_KEY, SNAPSHOT_LOCK_TIMEOUT_MS, SSL_SOCKET_FACTORY,
                                                      STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, INCLUDE_UNKNOWN_DATATYPES,
-                                                     SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SCHEMA_REFRESH_MODE, CommonConnectorConfig.TOMBSTONES_ON_DELETE,
-                                                     XMIN_FETCH_INTERVAL, SNAPSHOT_MODE_CLASS);
+                                                     RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SCHEMA_REFRESH_MODE, CommonConnectorConfig.TOMBSTONES_ON_DELETE,
+                                                     XMIN_FETCH_INTERVAL, TOASTED_VALUE_PLACEHOLDER, SNAPSHOT_MODE_CLASS, CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION);
 
-    private final TemporalPrecisionMode temporalPrecisionMode;
     private final HStoreHandlingMode  hStoreHandlingMode;
     private final SnapshotMode snapshotMode;
     private final SchemaRefreshMode schemaRefreshMode;
@@ -855,11 +810,11 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         super(
                 config,
                 config.getString(RelationalDatabaseConnectorConfig.SERVER_NAME),
-                null, // TODO whitelist handling implemented locally here for the time being
-                null
+                new SystemTablesPredicate(),
+                x -> x.schema() + "." + x.table(),
+                DEFAULT_SNAPSHOT_FETCH_SIZE
         );
 
-        this.temporalPrecisionMode = TemporalPrecisionMode.parse(config.getString(TIME_PRECISION_MODE));
         String hstoreHandlingModeStr = config.getString(PostgresConnectorConfig.HSTORE_HANDLING_MODE);
         HStoreHandlingMode hStoreHandlingMode = HStoreHandlingMode.parse(hstoreHandlingModeStr);
         this.hStoreHandlingMode = hStoreHandlingMode;
@@ -891,16 +846,24 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return getConfig().getBoolean(DROP_SLOT_ON_STOP);
     }
 
+    protected String publicationName() {
+        return getConfig().getString(PUBLICATION_NAME);
+    }
+
     protected String streamParams() {
         return getConfig().getString(STREAM_PARAMS);
     }
 
-    protected Duration statusUpdateInterval() {
-        return Duration.ofMillis(getConfig().getLong(PostgresConnectorConfig.STATUS_UPDATE_INTERVAL_MS));
+    protected int maxRetries() {
+        return getConfig().getInteger(MAX_RETRIES);
     }
 
-    protected TemporalPrecisionMode temporalPrecisionMode() {
-        return temporalPrecisionMode;
+    protected Duration retryDelay() {
+        return Duration.ofMillis(getConfig().getInteger(RETRY_DELAY_MS));
+    }
+
+    protected Duration statusUpdateInterval() {
+        return Duration.ofMillis(getConfig().getLong(PostgresConnectorConfig.STATUS_UPDATE_INTERVAL_MS));
     }
 
     protected HStoreHandlingMode hStoreHandlingMode() {
@@ -913,13 +876,6 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     public Configuration jdbcConfig() {
         return getConfig().subset(DATABASE_CONFIG_PREFIX, true);
-    }
-
-    protected TopicSelectionStrategy topicSelectionStrategy() {
-        //TODO author=Horia Chiorean date=04/11/2016 description=implement this fully once the changes for MySQL are merged
-        //String value = config.getString(PostgresConnectorConfig.TOPIC_SELECTION_STRATEGY);
-        //return PostgresConnectorConfig.TopicSelectionStrategy.parse(value);
-        return PostgresConnectorConfig.TopicSelectionStrategy.TOPIC_PER_TABLE;
     }
 
     protected Map<String, ConfigValue> validate() {
@@ -946,40 +902,12 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return getConfig().getString(COLUMN_BLACKLIST);
     }
 
-    protected long snapshotLockTimeoutMillis() {
-        return getConfig().getLong(PostgresConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS);
+    protected Duration snapshotLockTimeout() {
+        return Duration.ofMillis(getConfig().getLong(PostgresConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS));
     }
 
     protected Snapshotter getSnapshotter() {
         return this.snapshotMode.getSnapshotter(getConfig());
-    }
-
-    public String snapshotSelectOverrides() {
-        return getConfig().getString(PostgresConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE);
-    }
-
-    public String snapshotSelectOverrideForTable(String table) {
-        return getConfig().getString(PostgresConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE + "." + table);
-    }
-
-    /**
-     * DBZ-1234 Obsolete once rows.fetch.size option has been removed;
-     * value can be passed to super constructor instead
-     */
-    @Deprecated
-    @Override
-    protected int defaultSnapshotFetchSize(Configuration config) {
-        // we use getString() method because it supports null as the return value
-        String rowsFetchSize = config.getString(ROWS_FETCH_SIZE);
-        if (rowsFetchSize != null) {
-            LOGGER.warn("Property '{}' will be removed in next releases, use property '{}' instead of",
-                ROWS_FETCH_SIZE.name(), SNAPSHOT_FETCH_SIZE.name());
-            try {
-                return Integer.valueOf(rowsFetchSize);
-            }
-            catch (NumberFormatException e) {}
-        }
-        return DEFAULT_SNAPSHOT_FETCH_SIZE;
     }
 
     protected boolean skipRefreshSchemaOnMissingToastableData() {
@@ -990,30 +918,40 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         return Duration.ofMillis(getConfig().getLong(PostgresConnectorConfig.XMIN_FETCH_INTERVAL));
     }
 
-    protected static ConfigDef configDef() {
-        ConfigDef config = new ConfigDef();
-        Field.group(config, "Postgres", SLOT_NAME, PLUGIN_NAME, RelationalDatabaseConnectorConfig.SERVER_NAME, DATABASE_NAME, HOSTNAME, PORT,
-                    USER, PASSWORD, ON_CONNECT_STATEMENTS, SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD, SSL_ROOT_CERT, SSL_CLIENT_KEY,
-                    DROP_SLOT_ON_STOP, STREAM_PARAMS, SSL_SOCKET_FACTORY, STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, XMIN_FETCH_INTERVAL, SNAPSHOT_MODE_CLASS);
-        Field.group(config, "Events", SCHEMA_WHITELIST, SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
-                    COLUMN_BLACKLIST, INCLUDE_UNKNOWN_DATATYPES, SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
-                    CommonConnectorConfig.TOMBSTONES_ON_DELETE, Heartbeat.HEARTBEAT_INTERVAL,
-                    Heartbeat.HEARTBEAT_TOPICS_PREFIX);
-        Field.group(config, "Connector", TOPIC_SELECTION_STRATEGY, CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.MAX_QUEUE_SIZE,
-                    CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-                    SNAPSHOT_MODE, SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE, SCHEMA_REFRESH_MODE, ROWS_FETCH_SIZE);
-
-        return config;
+    protected byte[] toastedValuePlaceholder() {
+        final String placeholder = getConfig().getString(TOASTED_VALUE_PLACEHOLDER);
+        if (placeholder.startsWith("hex:")) {
+            return Strings.hexStringToByteArray(placeholder.substring(4));
+        }
+        return placeholder.getBytes();
     }
 
-    private static int validateSchemaBlacklist(Configuration config, Field field, Field.ValidationOutput problems) {
-        String whitelist = config.getString(SCHEMA_WHITELIST);
-        String blacklist = config.getString(SCHEMA_BLACKLIST);
-        if (whitelist != null && blacklist != null) {
-            problems.accept(SCHEMA_BLACKLIST, blacklist, "Schema whitelist is already specified");
-            return 1;
+    @Override
+    protected SourceInfoStructMaker<? extends AbstractSourceInfo> getSourceInfoStructMaker(Version version) {
+        switch (version) {
+        case V1:
+            return new LegacyV1PostgresSourceInfoStructMaker(Module.name(), Module.version(), this);
+        default:
+            return new PostgresSourceInfoStructMaker(Module.name(), Module.version(), this);
         }
-        return 0;
+    }
+
+    protected static ConfigDef configDef() {
+        ConfigDef config = new ConfigDef();
+        Field.group(config, "Postgres", SLOT_NAME, PUBLICATION_NAME, PLUGIN_NAME, RelationalDatabaseConnectorConfig.SERVER_NAME, DATABASE_NAME, HOSTNAME, PORT,
+                    USER, PASSWORD, ON_CONNECT_STATEMENTS, SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD, SSL_ROOT_CERT, SSL_CLIENT_KEY,
+                    DROP_SLOT_ON_STOP, STREAM_PARAMS, MAX_RETRIES, RETRY_DELAY_MS, SSL_SOCKET_FACTORY, STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, XMIN_FETCH_INTERVAL);
+        Field.group(config, "Events", SCHEMA_WHITELIST, SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
+                    COLUMN_BLACKLIST, MSG_KEY_COLUMNS, INCLUDE_UNKNOWN_DATATYPES, SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
+                    CommonConnectorConfig.TOMBSTONES_ON_DELETE, Heartbeat.HEARTBEAT_INTERVAL,
+                    Heartbeat.HEARTBEAT_TOPICS_PREFIX, CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
+                    TOASTED_VALUE_PLACEHOLDER);
+        Field.group(config, "Connector", CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.MAX_QUEUE_SIZE,
+                    CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
+                    SNAPSHOT_MODE, SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE,
+                    SCHEMA_REFRESH_MODE, SNAPSHOT_MODE_CLASS);
+
+        return config;
     }
 
     private static int validateTableBlacklist(Configuration config, Field field, Field.ValidationOutput problems) {
@@ -1025,4 +963,17 @@ public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
         }
         return 0;
     }
-}
+
+    @Override
+    public String getContextName() {
+        return Module.contextName();
+    }
+
+    private static class SystemTablesPredicate implements TableFilter {
+        protected static final List<String> SYSTEM_SCHEMAS = Arrays.asList("pg_catalog", "information_schema");
+
+        @Override
+        public boolean isIncluded(TableId t) {
+            return !SYSTEM_SCHEMAS.contains(t.schema().toLowerCase());
+        }
+    }}

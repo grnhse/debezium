@@ -813,6 +813,7 @@ public class JdbcConnection implements AutoCloseable {
             try {
                 statementCache.values().forEach(this::cleanupPreparedStatement);
                 statementCache.clear();
+                LOGGER.trace("Closing database connection");
                 conn.close();
             } finally {
                 conn = null;
@@ -987,9 +988,9 @@ public class JdbcConnection implements AutoCloseable {
         // Read the metadata for the table columns ...
         DatabaseMetaData metadata = connection().getMetaData();
 
-        // Find views as they cannot be snapshotted
+        // Find regular and materialized views as they cannot be snapshotted
         final Set<TableId> viewIds = new HashSet<>();
-        try (final ResultSet rs = metadata.getTables(databaseCatalog, schemaNamePattern, null, new String[] {"VIEW"})) {
+        try (final ResultSet rs = metadata.getTables(databaseCatalog, schemaNamePattern, null, new String[] {"VIEW", "MATERIALIZED VIEW"})) {
             while (rs.next()) {
                 final String catalogName = rs.getString(1);
                 final String schemaName = rs.getString(2);
@@ -1118,6 +1119,9 @@ public class JdbcConnection implements AutoCloseable {
         Connection conn = connection();
         try (Statement statement = conn.createStatement()) {
             for (String stmt : statements) {
+                if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("Executing statement {}", stmt);
+                }
                 statement.execute(stmt);
             }
         }

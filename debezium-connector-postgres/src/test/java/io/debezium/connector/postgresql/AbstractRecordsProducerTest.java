@@ -21,7 +21,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.Month;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -47,7 +49,13 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.junit.Rule;
+import org.junit.rules.TestRule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.SnapshotRecord;
 import io.debezium.data.Bits;
 import io.debezium.data.Json;
 import io.debezium.data.SchemaUtil;
@@ -58,7 +66,8 @@ import io.debezium.data.Xml;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
-import io.debezium.function.BlockingConsumer;
+import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.junit.TestLogger;
 import io.debezium.relational.TableId;
 import io.debezium.time.Date;
 import io.debezium.time.MicroDuration;
@@ -68,22 +77,31 @@ import io.debezium.time.Time;
 import io.debezium.time.Timestamp;
 import io.debezium.time.ZonedTime;
 import io.debezium.time.ZonedTimestamp;
-import io.debezium.util.VariableLatch;
+import io.debezium.util.Clock;
+import io.debezium.util.ElapsedTimeStrategy;
+import io.debezium.util.Testing;
 
 /**
  * Base class for the integration tests for the different {@link RecordsProducer} instances
  *
  * @author Horia Chiorean (hchiorea@redhat.com)
  */
-public abstract class AbstractRecordsProducerTest {
+public abstract class AbstractRecordsProducerTest extends AbstractConnectorTest {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(AbstractRecordsProducerTest.class);
+
+    @Rule
+    public TestRule logTestName = new TestLogger(LOGGER);
 
     protected static final Pattern INSERT_TABLE_MATCHING_PATTERN = Pattern.compile("insert into (.*)\\(.*\\) VALUES .*", Pattern.CASE_INSENSITIVE);
 
     protected static final String INSERT_CASH_TYPES_STMT = "INSERT INTO cash_table (csh) VALUES ('$1234.11')";
-    protected static final String INSERT_DATE_TIME_TYPES_STMT = "INSERT INTO time_table(ts, tsneg, ts_ms, ts_us, tz, date, ti, tip, ttz, tptz, it) " +
+    protected static final String INSERT_DATE_TIME_TYPES_STMT = "INSERT INTO time_table(ts, tsneg, ts_ms, ts_us, tz, date, ti, tip, ttf, ttz, tptz, it, ts_large, ts_large_us, ts_large_ms, tz_large) " +
                                                                 "VALUES ('2016-11-04T13:51:30.123456'::TIMESTAMP, '1936-10-25T22:10:12.608'::TIMESTAMP, '2016-11-04T13:51:30.123456'::TIMESTAMP, '2016-11-04T13:51:30.123456'::TIMESTAMP, '2016-11-04T13:51:30.123456+02:00'::TIMESTAMPTZ, " +
-                                                                "'2016-11-04'::DATE, '13:51:30'::TIME, '13:51:30.123'::TIME, '13:51:30.123789+02:00'::TIMETZ, '13:51:30.123+02:00'::TIMETZ, " +
-                                                                "'P1Y2M3DT4H5M0S'::INTERVAL)";
+                                                                "'2016-11-04'::DATE, '13:51:30'::TIME, '13:51:30.123'::TIME, '24:00:00'::TIME, '13:51:30.123789+02:00'::TIMETZ, '13:51:30.123+02:00'::TIMETZ, " +
+                                                                "'P1Y2M3DT4H5M6.78S'::INTERVAL," +
+                                                                "'21016-11-04T13:51:30.123456'::TIMESTAMP, '21016-11-04T13:51:30.123457'::TIMESTAMP, '21016-11-04T13:51:30.124'::TIMESTAMP," +
+                                                                "'21016-11-04T13:51:30.123456+07:00'::TIMESTAMPTZ)";
     protected static final String INSERT_BIN_TYPES_STMT = "INSERT INTO bitbin_table (ba, bol, bs, bv) " +
                                                           "VALUES (E'\\\\001\\\\002\\\\003'::bytea, '0'::bit(1), '11'::bit(2), '00'::bit(2))";
     protected static final String INSERT_GEOM_TYPES_STMT = "INSERT INTO geom_table(p) VALUES ('(1,1)'::point)";
@@ -155,12 +173,15 @@ public abstract class AbstractRecordsProducerTest {
     protected static final String INSERT_QUOTED_TYPES_STMT = "INSERT INTO \"Quoted_\"\" . Schema\".\"Quoted_\"\" . Table\" (\"Quoted_\"\" . Text_Column\") " +
                                                              "VALUES ('some text')";
 
-    protected static final String INSERT_CUSTOM_TYPES_STMT = "INSERT INTO custom_table (lt, i, n) " +
-            "VALUES ('Top.Collections.Pictures.Astronomy.Galaxies', '978-0-393-04002-9', NULL)";
+    protected static final String INSERT_CUSTOM_TYPES_STMT = "INSERT INTO custom_table (lt, i, n, lt_array) " +
+            "VALUES ('Top.Collections.Pictures.Astronomy.Galaxies', '978-0-393-04002-9', NULL, '{\"Ship.Frigate\",\"Ship.Destroyer\"}')";
 
     protected static final String INSERT_HSTORE_TYPE_STMT = "INSERT INTO hstore_table (hs) VALUES ('\"key\" => \"val\"'::hstore)";
 
-    protected static final String INSERT_HSTORE_TYPE_WITH_MULTIPLE_VALUES_STMT = "INSERT INTO hstore_table_mul (hs) VALUES ('\"key1\" => \"val1\",\"key2\" => \"val2\",\"key3\" => \"val3\"')";
+    protected static final String INSERT_HSTORE_TYPE_WITH_MULTIPLE_VALUES_STMT = "INSERT INTO hstore_table_mul (hs, hsarr) VALUES (" +
+            "'\"key1\" => \"val1\",\"key2\" => \"val2\",\"key3\" => \"val3\"', " +
+            "array['\"key4\" => \"val4\",\"key5\" => NULL'::hstore, '\"key6\" => \"val6\"']" +
+            ")";
 
     protected static final String INSERT_HSTORE_TYPE_WITH_NULL_VALUES_STMT = "INSERT INTO hstore_table_with_null (hs) VALUES ('\"key1\" => \"val1\",\"key2\" => NULL')";
 
@@ -286,8 +307,19 @@ public abstract class AbstractRecordsProducerTest {
         expected.put("key1", "val1");
         expected.put("key2", "val2");
         expected.put("key3", "val3");
-        return Arrays.asList(new SchemaAndValueField("hs", hstoreMapSchema(), expected));
-        }
+
+        Map<String, String> expectedArray1 = new HashMap<>();
+        expectedArray1.put("key4", "val4");
+        expectedArray1.put("key5", null);
+
+        Map<String, String> expectedArray2 = new HashMap<>();
+        expectedArray2.put("key6", "val6");
+
+        return Arrays.asList(
+                new SchemaAndValueField("hs", hstoreMapSchema(), expected),
+                new SchemaAndValueField("hsarr", SchemaBuilder.array(hstoreMapSchema()).optional().build(), Arrays.asList(expectedArray1, expectedArray2))
+        );
+    }
 
     protected List<SchemaAndValueField> schemaAndValueFieldForMapEncodedHStoreTypeWithNullValues(){
         final Map<String, String> expected = new HashMap<>();
@@ -319,7 +351,15 @@ public abstract class AbstractRecordsProducerTest {
 
     protected List<SchemaAndValueField> schemaAndValueFieldForJsonEncodedHStoreTypeWithMultipleValues(){
         final String expected = "{\"key1\":\"val1\",\"key2\":\"val2\",\"key3\":\"val3\"}";
-        return Arrays.asList(new SchemaAndValueField("hs", Json.builder().optional().build(), expected));
+        final List<String> expectedArray = Arrays.asList(
+                "{\"key5\":null,\"key4\":\"val4\"}",
+                "{\"key6\":\"val6\"}"
+        );
+
+        return Arrays.asList(
+                new SchemaAndValueField("hs", Json.builder().optional().build(), expected),
+                new SchemaAndValueField("hsarr", SchemaBuilder.array(Json.builder().optional().build()).optional().build(), expectedArray)
+        );
     }
 
     protected List<SchemaAndValueField> schemaAndValueFieldForJsonEncodedHStoreTypeWithNullValues(){
@@ -335,6 +375,12 @@ public abstract class AbstractRecordsProducerTest {
     protected List<SchemaAndValueField> schemaAndValueForMacaddr8Type() {
         final String expected = "08:00:2b:01:02:03:04:05";
         return Arrays.asList(new SchemaAndValueField("m", Schema.OPTIONAL_STRING_SCHEMA, expected));
+    }
+
+    protected List<SchemaAndValueField> schemaAndValueForMaterializedViewBaseType() {
+        return Arrays.asList(new SchemaAndValueField("i", Schema.OPTIONAL_INT32_SCHEMA, 1),
+                             new SchemaAndValueField("s", Schema.OPTIONAL_STRING_SCHEMA, "1")
+                );
     }
 
     protected List<SchemaAndValueField> schemasAndValuesForStringTypes() {
@@ -492,17 +538,33 @@ public abstract class AbstractRecordsProducerTest {
                             new SchemaAndValueField("bv", Bits.builder(2).optional().build(), new byte[] { 0, 0 }));
     }
 
+    private long asEpochMillis(String timestamp) {
+        return LocalDateTime.parse(timestamp).atOffset(ZoneOffset.UTC).toInstant().toEpochMilli();
+    }
+
+    private long asEpochMicros(String timestamp) {
+        Instant instant = LocalDateTime.parse(timestamp).atOffset(ZoneOffset.UTC).toInstant();
+        return instant.getEpochSecond() * 1_000_000 + instant.getNano() / 1_000;
+    }
+
     protected List<SchemaAndValueField> schemaAndValuesForDateTimeTypes() {
-        long expectedTs = MicroTimestamp.toEpochMicros(LocalDateTime.parse("2016-11-04T13:51:30.123456"), null);
-        long expectedTsMs = Timestamp.toEpochMillis(LocalDateTime.parse("2016-11-04T13:51:30.123456"), null);
-        long expectedNegTs = MicroTimestamp.toEpochMicros(LocalDateTime.parse("1936-10-25T22:10:12.608"), null);
+        long expectedTs = asEpochMicros("2016-11-04T13:51:30.123456");
+        long expectedTsMs = asEpochMillis("2016-11-04T13:51:30.123456");
+        long expectedNegTs = asEpochMicros("1936-10-25T22:10:12.608");
         String expectedTz = "2016-11-04T11:51:30.123456Z"; //timestamp is stored with TZ, should be read back with UTC
         int expectedDate = Date.toEpochDay(LocalDate.parse("2016-11-04"), null);
         long expectedTi = LocalTime.parse("13:51:30").toNanoOfDay() / 1_000;
         long expectedTiPrecision = LocalTime.parse("13:51:30.123").toNanoOfDay() / 1_000_000;
+        long expectedTtf = TimeUnit.DAYS.toNanos(1) / 1_000;
         String expectedTtz = "11:51:30.123789Z";  //time is stored with TZ, should be read back at GMT
         String expectedTtzPrecision = "11:51:30.123Z";
-        double interval = MicroDuration.durationMicros(1, 2, 3, 4, 5, 0, MicroDuration.DAYS_PER_MONTH_AVG);
+        long expectedInterval = MicroDuration.durationMicros(1, 2, 3, 4, 5, 6, 780000, MicroDuration.DAYS_PER_MONTH_AVG);
+
+        long expectedTsLarge = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 0, ZoneOffset.UTC).toInstant().toEpochMilli() * 1000 + 123456;
+        long expectedTsLargeUs = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 0, ZoneOffset.UTC).toInstant().toEpochMilli() * 1000 + 123457;
+        long expectedTsLargeMs = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 124000000, ZoneOffset.UTC).toInstant().toEpochMilli();
+
+        String expectedTzLarge = "+21016-11-04T06:51:30.123456Z";
 
         return Arrays.asList(new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), expectedTs),
                              new SchemaAndValueField("tsneg", MicroTimestamp.builder().optional().build(), expectedNegTs),
@@ -512,20 +574,30 @@ public abstract class AbstractRecordsProducerTest {
                              new SchemaAndValueField("date", Date.builder().optional().build(), expectedDate),
                              new SchemaAndValueField("ti", MicroTime.builder().optional().build(), expectedTi),
                              new SchemaAndValueField("tip", Time.builder().optional().build(), (int) expectedTiPrecision),
+                             new SchemaAndValueField("ttf", MicroTime.builder().optional().build(), expectedTtf),
                              new SchemaAndValueField("ttz", ZonedTime.builder().optional().build(), expectedTtz),
                              new SchemaAndValueField("tptz", ZonedTime.builder().optional().build(), expectedTtzPrecision),
-                             new SchemaAndValueField("it", MicroDuration.builder().optional().build(), interval));
+                             new SchemaAndValueField("it", MicroDuration.builder().optional().build(), expectedInterval),
+                             new SchemaAndValueField("ts_large", MicroTimestamp.builder().optional().build(), expectedTsLarge),
+                             new SchemaAndValueField("ts_large_us", MicroTimestamp.builder().optional().build(), expectedTsLargeUs),
+                             new SchemaAndValueField("ts_large_ms", Timestamp.builder().optional().build(), expectedTsLargeMs),
+                             new SchemaAndValueField("tz_large", ZonedTimestamp.builder().optional().build(), expectedTzLarge)
+                             );
     }
 
     protected List<SchemaAndValueField> schemaAndValuesForDateTimeTypesAdaptiveTimeMicroseconds() {
-        long expectedTs = MicroTimestamp.toEpochMicros(LocalDateTime.parse("2016-11-04T13:51:30.123456"), null);
-        long expectedTsMs = Timestamp.toEpochMillis(LocalDateTime.parse("2016-11-04T13:51:30.123456"), null);
-        long expectedNegTs = MicroTimestamp.toEpochMicros(LocalDateTime.parse("1936-10-25T22:10:12.608"), null);
+        long expectedTs = asEpochMicros("2016-11-04T13:51:30.123456");
+        long expectedTsMs = asEpochMillis("2016-11-04T13:51:30.123456");
+        long expectedNegTs = asEpochMicros("1936-10-25T22:10:12.608");
         String expectedTz = "2016-11-04T11:51:30.123456Z"; //timestamp is stored with TZ, should be read back with UTC
         int expectedDate = Date.toEpochDay(LocalDate.parse("2016-11-04"), null);
         long expectedTi = LocalTime.parse("13:51:30").toNanoOfDay() / 1_000;
         String expectedTtz = "11:51:30.123789Z";  //time is stored with TZ, should be read back at GMT
-        double interval = MicroDuration.durationMicros(1, 2, 3, 4, 5, 0, MicroDuration.DAYS_PER_MONTH_AVG);
+        long expectedInterval = MicroDuration.durationMicros(1, 2, 3, 4, 5, 6.78, MicroDuration.DAYS_PER_MONTH_AVG);
+
+        long expectedTsLarge = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 0, ZoneOffset.UTC).toInstant().toEpochMilli() * 1000 + 123456;
+        long expectedTsLargeUs = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 0, ZoneOffset.UTC).toInstant().toEpochMilli() * 1000 + 123457;
+        long expectedTsLargeMs = OffsetDateTime.of(21016, 11, 4, 13, 51, 30, 124000000, ZoneOffset.UTC).toInstant().toEpochMilli();
 
         return Arrays.asList(new SchemaAndValueField("ts", MicroTimestamp.builder().optional().build(), expectedTs),
                 new SchemaAndValueField("tsneg", MicroTimestamp.builder().optional().build(), expectedNegTs),
@@ -535,7 +607,11 @@ public abstract class AbstractRecordsProducerTest {
                 new SchemaAndValueField("date", Date.builder().optional().build(), expectedDate),
                 new SchemaAndValueField("ti", MicroTime.builder().optional().build(), expectedTi),
                 new SchemaAndValueField("ttz", ZonedTime.builder().optional().build(), expectedTtz),
-                new SchemaAndValueField("it", MicroDuration.builder().optional().build(), interval));
+                new SchemaAndValueField("it", MicroDuration.builder().optional().build(), expectedInterval),
+                new SchemaAndValueField("ts_large", MicroTimestamp.builder().optional().build(), expectedTsLarge),
+                new SchemaAndValueField("ts_large_us", MicroTimestamp.builder().optional().build(), expectedTsLargeUs),
+                new SchemaAndValueField("ts_large_ms", Timestamp.builder().optional().build(), expectedTsLargeMs)
+                );
     }
 
     protected List<SchemaAndValueField> schemaAndValuesForMoneyTypes() {
@@ -704,7 +780,8 @@ public abstract class AbstractRecordsProducerTest {
     protected List<SchemaAndValueField> schemasAndValuesForCustomTypes() {
         return Arrays.asList(new SchemaAndValueField("lt", Schema.OPTIONAL_BYTES_SCHEMA, ByteBuffer.wrap("Top.Collections.Pictures.Astronomy.Galaxies".getBytes())),
                              new SchemaAndValueField("i", Schema.BYTES_SCHEMA, ByteBuffer.wrap("0-393-04002-X".getBytes())),
-                             new SchemaAndValueField("n", Schema.OPTIONAL_STRING_SCHEMA, null));
+                             new SchemaAndValueField("n", Schema.OPTIONAL_STRING_SCHEMA, null),
+                             new SchemaAndValueField("lt_array", Schema.OPTIONAL_BYTES_SCHEMA, ByteBuffer.wrap("{Ship.Frigate,Ship.Destroyer}".getBytes())));
 
     }
 
@@ -771,9 +848,10 @@ public abstract class AbstractRecordsProducerTest {
     protected void assertRecordOffsetAndSnapshotSource(SourceRecord record, boolean shouldBeSnapshot, boolean shouldBeLastSnapshotRecord) {
         Map<String, ?> offset = record.sourceOffset();
         assertNotNull(offset.get(SourceInfo.TXID_KEY));
-        assertNotNull(offset.get(SourceInfo.TIMESTAMP_KEY));
+        assertNotNull(offset.get(SourceInfo.TIMESTAMP_USEC_KEY));
         assertNotNull(offset.get(SourceInfo.LSN_KEY));
         Object snapshot = offset.get(SourceInfo.SNAPSHOT_KEY);
+
         Object lastSnapshotRecord = offset.get(SourceInfo.LAST_SNAPSHOT_RECORD_KEY);
 
         if (shouldBeSnapshot) {
@@ -785,17 +863,19 @@ public abstract class AbstractRecordsProducerTest {
             assertNull("Last snapshot marker not expected, but found", lastSnapshotRecord);
         }
         final Struct envelope = (Struct) record.value();
-        if (envelope != null) {
+        if (envelope != null && envelope.schema().name().endsWith(".Envelope")) {
             final Struct source = (Struct) envelope.get("source");
-            final Boolean sourceSnapshot = source.getBoolean(SourceInfo.SNAPSHOT_KEY);
-            final Boolean sourceLastSnapshotRecord = source.getBoolean(SourceInfo.LAST_SNAPSHOT_RECORD_KEY);
+            final SnapshotRecord sourceSnapshot = SnapshotRecord.fromSource(source);
             if (shouldBeSnapshot) {
-                assertTrue("Snapshot marker expected in source but not found", sourceSnapshot);
-                assertEquals("Last snapshot record marker in source mismatch", shouldBeLastSnapshotRecord, sourceLastSnapshotRecord);
+                if (shouldBeLastSnapshotRecord) {
+                    assertEquals("Expected snapshot last record", SnapshotRecord.LAST, sourceSnapshot);
+                }
+                else {
+                    assertEquals("Expected snapshot intermediary record", SnapshotRecord.TRUE, sourceSnapshot);
+                }
             }
             else {
                 assertNull("Source snapshot marker not expected, but found", sourceSnapshot);
-                assertNull("Source last snapshot marker not expected, but found", sourceLastSnapshotRecord);
             }
         }
     }
@@ -889,7 +969,7 @@ public abstract class AbstractRecordsProducerTest {
             } else if (actualValue instanceof Struct) {
                 assertStruct((Struct) value, (Struct) actualValue);
             } else {
-                assertEquals("Values don't match for " + fieldName, value, actualValue);
+                assertEquals("Values don't match for field '" + fieldName + "'", value, actualValue);
             }
         }
 
@@ -928,14 +1008,14 @@ public abstract class AbstractRecordsProducerTest {
          return new TestConsumer(expectedRecordsCount, topicPrefixes);
     }
 
-    protected static class TestConsumer implements BlockingConsumer<ChangeEvent> {
+    protected class TestConsumer {
         private final ConcurrentLinkedQueue<SourceRecord> records;
-        private final VariableLatch latch;
+        private int expectedRecordsCount;
         private final List<String> topicPrefixes;
         private boolean ignoreExtraRecords = false;
 
         protected TestConsumer(int expectedRecordsCount, String... topicPrefixes) {
-            this.latch = new VariableLatch(expectedRecordsCount);
+            this.expectedRecordsCount = expectedRecordsCount;
             this.records = new ConcurrentLinkedQueue<>();
             this.topicPrefixes = Arrays.stream(topicPrefixes)
                     .map(p -> TestHelper.TEST_SERVER + "." + p)
@@ -946,22 +1026,33 @@ public abstract class AbstractRecordsProducerTest {
             this.ignoreExtraRecords = ignoreExtraRecords;
         }
 
-        @Override
-        public void accept(ChangeEvent event) {
-            final SourceRecord record = event.getRecord();
-            if ( ignoreTopic(record.topic()) ) {
+        public void accept(SourceRecord record) {
+            if (ignoreTopic(record.topic())) {
                 return;
             }
 
-            if (latch.getCount() == 0) {
-                if (ignoreExtraRecords) {
-                    records.add(record);
-                } else {
+            if (records.size() >= expectedRecordsCount) {
+                addRecord(record);
+                if (!ignoreExtraRecords) {
                     fail("received more events than expected");
                 }
-            } else {
-                records.add(record);
-                latch.countDown();
+            }
+            else {
+                addRecord(record);
+            }
+        }
+
+        private void addRecord(SourceRecord record) {
+            records.add(record);
+            if (Testing.Debug.isEnabled()) {
+                Testing.debug("Consumed record " + records.size() + " / " + expectedRecordsCount + " ("
+                        + (expectedRecordsCount - records.size()) + " more)");
+                Testing.debug(record);
+            }
+            else if (Testing.Print.isEnabled()) {
+                Testing.print("Consumed record " + records.size() + " / " + expectedRecordsCount + " ("
+                        + (expectedRecordsCount - records.size()) + " more)");
+                Testing.print(record);
             }
         }
 
@@ -980,8 +1071,7 @@ public abstract class AbstractRecordsProducerTest {
         }
 
         protected void expects(int expectedRecordsCount) {
-            assert latch.getCount() == 0;
-            this.latch.countUp(expectedRecordsCount);
+            this.expectedRecordsCount = expectedRecordsCount;
         }
 
         protected SourceRecord remove() {
@@ -1001,9 +1091,32 @@ public abstract class AbstractRecordsProducerTest {
         }
 
         protected void await(long timeout, TimeUnit unit) throws InterruptedException {
-            if (!latch.await(timeout, unit)) {
-                fail("Consumer is still expecting " + latch.getCount() + " records, as it received only " + records.size());
+            final ElapsedTimeStrategy timer = ElapsedTimeStrategy.constant(Clock.SYSTEM, unit.toMillis(timeout));
+            timer.hasElapsed();
+            while (!timer.hasElapsed()) {
+                final SourceRecord r = consumeRecord();
+                if (r != null) {
+                    accept(r);
+                    if (records.size() == expectedRecordsCount) {
+                        break;
+                    }
+                }
+            }
+            if (records.size() != expectedRecordsCount) {
+                fail("Consumer is still expecting " + (expectedRecordsCount -records.size()) + " records, as it received only " + records.size());
             }
         }
+    }
+
+    protected void waitForSnapshotToBeCompleted() throws InterruptedException {
+        waitForSnapshotToBeCompleted("postgres", "test_server");
+    }
+
+    protected void waitForStreamingToStart() throws InterruptedException {
+        waitForStreamingRunning("postgres", "test_server");
+    }
+
+    protected void assertWithTask(Consumer<SourceTask> consumer) {
+        engine.runWithTask(consumer);
     }
 }

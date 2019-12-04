@@ -14,9 +14,9 @@ import java.util.stream.Collectors;
 
 import io.debezium.annotation.Immutable;
 import io.debezium.config.Configuration;
-import io.debezium.relational.ColumnId;
 import io.debezium.relational.Selectors;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.util.Collect;
 
 /**
@@ -30,6 +30,9 @@ public class Filters {
     protected static final Set<String> BUILT_IN_DB_NAMES = Collect.unmodifiableSet("mysql", "performance_schema", "sys", "information_schema");
 
     protected static boolean isBuiltInDatabase(String databaseName) {
+        if (databaseName == null) {
+            return false;
+        }
         return BUILT_IN_DB_NAMES.contains(databaseName.toLowerCase());
     }
 
@@ -57,13 +60,13 @@ public class Filters {
     private final Predicate<TableId> tableFilter;
     private final Predicate<String> isBuiltInDb;
     private final Predicate<TableId> isBuiltInTable;
-    private final Predicate<ColumnId> columnFilter;
+    private final ColumnNameFilter columnFilter;
 
     private Filters(Predicate<String> dbFilter,
                     Predicate<TableId> tableFilter,
                     Predicate<String> isBuiltInDb,
                     Predicate<TableId> isBuiltInTable,
-                    Predicate<ColumnId> columnFilter) {
+                    ColumnNameFilter columnFilter) {
         this.dbFilter = dbFilter;
         this.tableFilter = tableFilter;
         this.isBuiltInDb = isBuiltInDb;
@@ -87,7 +90,7 @@ public class Filters {
         return isBuiltInDb;
     }
 
-    public Predicate<ColumnId> columnFilter() {
+    public ColumnNameFilter columnFilter() {
         return columnFilter;
     }
 
@@ -97,7 +100,7 @@ public class Filters {
         private Predicate<TableId> tableFilter;
         private Predicate<String> isBuiltInDb = Filters::isBuiltInDatabase;
         private Predicate<TableId> isBuiltInTable = Filters::isBuiltInTable;
-        private Predicate<ColumnId> columnFilter;
+        private ColumnNameFilter columnFilter;
         private final Configuration config;
 
         /**
@@ -113,7 +116,7 @@ public class Filters {
                                   config.getString(MySqlConnectorConfig.TABLE_BLACKLIST));
 
             // Define the filter that excludes blacklisted columns, truncated columns, and masked columns ...
-            this.columnFilter = Selectors.excludeColumns(config.getString(MySqlConnectorConfig.COLUMN_BLACKLIST));
+            this.columnFilter = ColumnNameFilter.getInstance(config.getString(MySqlConnectorConfig.COLUMN_BLACKLIST));
         }
 
         /**

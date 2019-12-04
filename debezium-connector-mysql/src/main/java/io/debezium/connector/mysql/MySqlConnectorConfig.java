@@ -19,14 +19,12 @@ import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
-import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SourceInfoStructMaker;
 import io.debezium.heartbeat.Heartbeat;
-import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.JdbcValueConverters.BigIntUnsignedMode;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
-import io.debezium.relational.Tables.TableFilter;
-import io.debezium.relational.ddl.DdlParser;
 import io.debezium.relational.history.DatabaseHistory;
 import io.debezium.relational.history.KafkaDatabaseHistory;
 
@@ -526,69 +524,6 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
         }
     }
 
-    public static enum DdlParsingMode implements EnumeratedValue {
-
-        LEGACY("legacy") {
-            @Override
-            public DdlParser getNewParserInstance(JdbcValueConverters valueConverters, TableFilter tableFilter) {
-                return new MySqlDdlParser(false, (MySqlValueConverters) valueConverters);
-            }
-        },
-        ANTLR("antlr") {
-            @Override
-            public DdlParser getNewParserInstance(JdbcValueConverters valueConverters, TableFilter tableFilter) {
-                return new MySqlAntlrDdlParser((MySqlValueConverters) valueConverters, tableFilter);
-            }
-        };
-
-        private final String value;
-
-        private DdlParsingMode(String value) {
-            this.value = value;
-        }
-
-        @Override
-        public String getValue() {
-            return value;
-        }
-
-        public abstract DdlParser getNewParserInstance(JdbcValueConverters valueConverters, TableFilter tableFilter);
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @return the matching option, or null if no match is found
-         */
-        public static DdlParsingMode parse(String value) {
-            if (value == null) {
-                return null;
-            }
-            value = value.trim();
-            for (DdlParsingMode option : DdlParsingMode.values()) {
-                if (option.getValue().equalsIgnoreCase(value)) {
-                    return option;
-                }
-            }
-            return null;
-        }
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @param defaultValue the default value; may be null
-         * @return the matching option, or null if no match is found and the non-null default is invalid
-         */
-        public static DdlParsingMode parse(String value, String defaultValue) {
-            DdlParsingMode mode = parse(value);
-            if (mode == null && defaultValue != null) {
-                mode = parse(defaultValue);
-            }
-            return mode;
-        }
-    }
-
     /**
      * {@link Integer#MIN_VALUE Minimum value} used for fetch size hint.
      * See <a href="https://issues.jboss.org/browse/DBZ-94">DBZ-94</a> for details.
@@ -649,6 +584,9 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                            .withDescription("A semicolon separated list of SQL statements to be executed when a JDBC connection (not binlog reading connection) to the database is established. "
                                                                    + "Note that the connector may establish JDBC connections at its own discretion, so this should typically be used for configuration of session parameters only,"
                                                                    + "but not for executing DML statements. Use doubled semicolon (';;') to use a semicolon as a character and not as a delimiter.");
+
+    public static final Field SERVER_NAME = RelationalDatabaseConnectorConfig.SERVER_NAME
+            .withValidation(CommonConnectorConfig::validateServerNameIsDifferentFromHistoryTopicName);
 
     public static final Field SERVER_ID = Field.create("database.server.id")
                                                .withDisplayName("Cluster ID")
@@ -946,24 +884,6 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                            + "'never' to specify the connector should never run a snapshot and that upon first startup the connector should read from the beginning of the binlog. "
                                                            + "The 'never' mode should be used with care, and only when the binlog is known to contain all history.");
 
-    /**
-     * @deprecated Replaced with SNAPSHOT_LOCKING_MODE
-     */
-    @Deprecated
-    public static final Field SNAPSHOT_MINIMAL_LOCKING = Field.create("snapshot.minimal.locks")
-                                                              .withDisplayName("Use shortest database locking for snapshots")
-                                                              .withType(Type.BOOLEAN)
-                                                              .withWidth(Width.SHORT)
-                                                              .withImportance(Importance.LOW)
-                                                              .withDescription("NOTE: This option has been deprecated in favor of snapshot.locking.mode. \n"
-                                                                      + "Controls how long the connector holds onto the global read lock while it is performing a snapshot. The default is 'true', "
-                                                                      + "which means the connector holds the global read lock (and thus prevents any updates) for just the initial portion of the snapshot "
-                                                                      + "while the database schemas and other metadata are being read. The remaining work in a snapshot involves selecting all rows from "
-                                                                      + "each table, and this can be done using the snapshot process' REPEATABLE READ transaction even when the lock is no longer held and "
-                                                                      + "other operations are updating the database. However, in some cases it may be desirable to block all writes for the entire duration "
-                                                                      + "of the snapshot; in such cases set this property to 'false'.")
-                                                              .withDefault(true);
-
     public static final Field SNAPSHOT_LOCKING_MODE = Field.create("snapshot.locking.mode")
                                                            .withDisplayName("Snapshot locking mode")
                                                            .withEnum(SnapshotLockingMode.class, SnapshotLockingMode.MINIMAL)
@@ -992,16 +912,14 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                            + "point, both old and new binlog readers will be momentarily halted and new binlog reader will start that will read the binlog for all "
                                                            + "configured tables. The parallel binlog reader will have a configured server id of 10000 + the primary binlog reader's server id.");
 
-    public static final Field TIME_PRECISION_MODE = Field.create("time.precision.mode")
-                                                         .withDisplayName("Time Precision")
+
+    public static final Field TIME_PRECISION_MODE = RelationalDatabaseConnectorConfig.TIME_PRECISION_MODE
                                                          .withEnum(TemporalPrecisionMode.class, TemporalPrecisionMode.ADAPTIVE_TIME_MICROSECONDS)
-                                                         .withWidth(Width.SHORT)
-                                                         .withImportance(Importance.MEDIUM)
-                                                         .withDescription("Time, date, and timestamps can be represented with different kinds of precisions, including:"
-                                                                 + "'adaptive_time_microseconds' (the default) like 'adaptive' mode, but TIME fields always use microseconds precision;"
-                                                                 + "'adaptive' (deprecated) bases the precision of time, date, and timestamp values on the database column's precision; "
-                                                                 + "'connect' always represents time, date, and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
-                                                                 + "which uses millisecond precision regardless of the database columns' precision.");
+                                                         .withValidation(MySqlConnectorConfig::validateTimePrecisionMode)
+                                                         .withDescription("Time, date and timestamps can be represented with different kinds of precisions, including:"
+                                                           + "'adaptive_time_microseconds': the precision of date and timestamp values is based the database column's precision; but time fields always use microseconds precision;"
+                                                           + "'connect': always represents time, date and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
+                                                           + "which uses millisecond precision regardless of the database columns' precision.");
 
     public static final Field BIGINT_UNSIGNED_HANDLING_MODE = Field.create("bigint.unsigned.handling.mode")
                                                            .withDisplayName("BIGINT UNSIGNED Handling")
@@ -1031,27 +949,6 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                              + "'fail' (the default) an exception indicating the problematic event and its binlog position is raised, causing the connector to be stopped; "
                              + "'warn' the problematic event and its binlog position will be logged and the event will be skipped;"
                              + "'ignore' the problematic event will be skipped.");
-
-    public static final Field SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE = Field.create("snapshot.select.statement.overrides")
-            .withDisplayName("List of tables where the default select statement used during snapshotting should be overridden.")
-            .withType(Type.STRING)
-            .withWidth(Width.LONG)
-            .withImportance(Importance.MEDIUM)
-            .withDescription(" This property contains a comma-separated list of fully-qualified tables (DB_NAME.TABLE_NAME). Select statements for the individual tables are " +
-                    "specified in further configuration properties, one for each table, identified by the id 'snapshot.select.statement.overrides.[DB_NAME].[TABLE_NAME]'. " +
-                    "The value of those properties is the select statement to use when retrieving data from the specific table during snapshotting. " +
-                    "A possible use case for large append-only tables is setting a specific point where to start (resume) snapshotting, in case a previous snapshotting was interrupted.");
-
-    public static final Field DDL_PARSER_MODE = Field.create("ddl.parser.mode")
-            .withDisplayName("DDL parser mode")
-            .withEnum(DdlParsingMode.class, DdlParsingMode.ANTLR)
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("MySQL DDL statements can be parsed in different ways:" +
-                    "'legacy' parsing is creating a TokenStream and comparing token by token with an expected values." +
-                    "The decisions are made by matched token values." +
-                    "'antlr' (the default) uses generated parser from MySQL grammar using ANTLR v4 tool which use ALL(*) algorithm for parsing." +
-                    "This parser creates a parsing tree for DDL statement, then walks trough it and apply changes by node types in parsed tree.");
 
     /**
      * Method that generates a Field for specifying that string columns whose names match a set of regular expressions should
@@ -1102,7 +999,7 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
      * The set of {@link Field}s defined as part of this configuration.
      */
     public static Field.Set ALL_FIELDS = Field.setOf(USER, PASSWORD, HOSTNAME, PORT, ON_CONNECT_STATEMENTS, SERVER_ID, SERVER_ID_OFFSET,
-                                                     RelationalDatabaseConnectorConfig.SERVER_NAME,
+                                                     SERVER_NAME,
                                                      CONNECTION_TIMEOUT_MS, KEEP_ALIVE, KEEP_ALIVE_INTERVAL_MS,
                                                      CommonConnectorConfig.MAX_QUEUE_SIZE,
                                                      CommonConnectorConfig.MAX_BATCH_SIZE,
@@ -1111,8 +1008,9 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                      Heartbeat.HEARTBEAT_TOPICS_PREFIX, DATABASE_HISTORY, INCLUDE_SCHEMA_CHANGES, INCLUDE_SQL_QUERY,
                                                      TABLE_WHITELIST, TABLE_BLACKLIST, TABLES_IGNORE_BUILTIN,
                                                      DATABASE_WHITELIST, DATABASE_BLACKLIST,
-                                                     COLUMN_BLACKLIST,
-                                                     SNAPSHOT_MODE, SNAPSHOT_NEW_TABLES, SNAPSHOT_MINIMAL_LOCKING, SNAPSHOT_LOCKING_MODE,
+                                                     COLUMN_BLACKLIST, MSG_KEY_COLUMNS,
+                                                     SNAPSHOT_MODE, SNAPSHOT_NEW_TABLES, SNAPSHOT_LOCKING_MODE,
+                                                     RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
                                                      GTID_SOURCE_INCLUDES, GTID_SOURCE_EXCLUDES,
                                                      GTID_SOURCE_FILTER_DML_EVENTS,
                                                      GTID_NEW_CHANNEL_POSITION,
@@ -1124,8 +1022,8 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                      INCONSISTENT_SCHEMA_HANDLING_MODE,
                                                      CommonConnectorConfig.SNAPSHOT_DELAY_MS,
                                                      CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-                                                     DDL_PARSER_MODE,
-                                                     CommonConnectorConfig.TOMBSTONES_ON_DELETE, ENABLE_TIME_ADJUSTER);
+                                                     CommonConnectorConfig.TOMBSTONES_ON_DELETE, ENABLE_TIME_ADJUSTER,
+                                                     CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION);
 
     /**
      * The set of {@link Field}s that are included in the {@link #configDef() configuration definition}. This includes
@@ -1142,33 +1040,21 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                                                                 DatabaseHistory.DDL_FILTER);
 
     private final SnapshotLockingMode snapshotLockingMode;
-    private final DdlParsingMode ddlParsingMode;
     private final GtidNewChannelPosition gitIdNewChannelPosition;
     private final SnapshotNewTables snapshotNewTables;
+    private final TemporalPrecisionMode temporalPrecisionMode;
 
     public MySqlConnectorConfig(Configuration config) {
         super(
                 config,
-                config.getString(RelationalDatabaseConnectorConfig.SERVER_NAME),
+                config.getString(SERVER_NAME),
                 null, // TODO whitelist handling is still done locally here
-                null
+                null,
+                DEFAULT_SNAPSHOT_FETCH_SIZE
         );
 
-        // If deprecated snapshot.minimal.locking property is explicitly configured
-        if (config.hasKey(MySqlConnectorConfig.SNAPSHOT_MINIMAL_LOCKING.name())) {
-            // Coerce it into its replacement appropriate snapshot.locking.mode value
-            if (config.getBoolean(MySqlConnectorConfig.SNAPSHOT_MINIMAL_LOCKING)) {
-                this.snapshotLockingMode = SnapshotLockingMode.MINIMAL;
-            } else {
-                this.snapshotLockingMode = SnapshotLockingMode.EXTENDED;
-            }
-        } else {
-            // Otherwise use configured snapshot.locking.mode configuration.
-            this.snapshotLockingMode = SnapshotLockingMode.parse(config.getString(SNAPSHOT_LOCKING_MODE), SNAPSHOT_LOCKING_MODE.defaultValueAsString());
-        }
-
-        String ddlParsingModeStr = config.getString(MySqlConnectorConfig.DDL_PARSER_MODE);
-        this.ddlParsingMode = DdlParsingMode.parse(ddlParsingModeStr, MySqlConnectorConfig.DDL_PARSER_MODE.defaultValueAsString());
+        this.temporalPrecisionMode = TemporalPrecisionMode.parse(config.getString(TIME_PRECISION_MODE));
+        this.snapshotLockingMode = SnapshotLockingMode.parse(config.getString(SNAPSHOT_LOCKING_MODE), SNAPSHOT_LOCKING_MODE.defaultValueAsString());
 
         String gitIdNewChannelPosition = config.getString(MySqlConnectorConfig.GTID_NEW_CHANNEL_POSITION);
         this.gitIdNewChannelPosition = GtidNewChannelPosition.parse(gitIdNewChannelPosition, MySqlConnectorConfig.GTID_NEW_CHANNEL_POSITION.defaultValueAsString());
@@ -1181,10 +1067,6 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
         return this.snapshotLockingMode;
     }
 
-    public DdlParsingMode getDdlParsingMode() {
-        return ddlParsingMode;
-    }
-
     public GtidNewChannelPosition gtidNewChannelPosition() {
         return gitIdNewChannelPosition;
     }
@@ -1193,14 +1075,9 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
         return snapshotNewTables;
     }
 
-    @Override
-    protected int defaultSnapshotFetchSize(Configuration config) {
-        return DEFAULT_SNAPSHOT_FETCH_SIZE;
-    }
-
     protected static ConfigDef configDef() {
         ConfigDef config = new ConfigDef();
-        Field.group(config, "MySQL", HOSTNAME, PORT, USER, PASSWORD, ON_CONNECT_STATEMENTS, RelationalDatabaseConnectorConfig.SERVER_NAME, SERVER_ID, SERVER_ID_OFFSET,
+        Field.group(config, "MySQL", HOSTNAME, PORT, USER, PASSWORD, ON_CONNECT_STATEMENTS, SERVER_NAME, SERVER_ID, SERVER_ID_OFFSET,
                     SSL_MODE, SSL_KEYSTORE, SSL_KEYSTORE_PASSWORD, SSL_TRUSTSTORE, SSL_TRUSTSTORE_PASSWORD, JDBC_DRIVER);
         Field.group(config, "History Storage", KafkaDatabaseHistory.BOOTSTRAP_SERVERS,
                     KafkaDatabaseHistory.TOPIC, KafkaDatabaseHistory.RECOVERY_POLL_ATTEMPTS,
@@ -1208,14 +1085,15 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
                     DatabaseHistory.SKIP_UNPARSEABLE_DDL_STATEMENTS, DatabaseHistory.DDL_FILTER,
                     DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL);
         Field.group(config, "Events", INCLUDE_SCHEMA_CHANGES, INCLUDE_SQL_QUERY, TABLES_IGNORE_BUILTIN, DATABASE_WHITELIST, TABLE_WHITELIST,
-                    COLUMN_BLACKLIST, TABLE_BLACKLIST, DATABASE_BLACKLIST,
+                    COLUMN_BLACKLIST, TABLE_BLACKLIST, DATABASE_BLACKLIST, MSG_KEY_COLUMNS,
+                    RelationalDatabaseConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
                     GTID_SOURCE_INCLUDES, GTID_SOURCE_EXCLUDES, GTID_SOURCE_FILTER_DML_EVENTS, GTID_NEW_CHANNEL_POSITION, BUFFER_SIZE_FOR_BINLOG_READER,
                     Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX, EVENT_DESERIALIZATION_FAILURE_HANDLING_MODE, INCONSISTENT_SCHEMA_HANDLING_MODE,
-                    CommonConnectorConfig.TOMBSTONES_ON_DELETE);
+                    CommonConnectorConfig.TOMBSTONES_ON_DELETE, CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION);
         Field.group(config, "Connector", CONNECTION_TIMEOUT_MS, KEEP_ALIVE, KEEP_ALIVE_INTERVAL_MS, CommonConnectorConfig.MAX_QUEUE_SIZE,
                     CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.POLL_INTERVAL_MS,
-                    SNAPSHOT_MODE, SNAPSHOT_LOCKING_MODE, SNAPSHOT_NEW_TABLES, SNAPSHOT_MINIMAL_LOCKING, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE,
-                    BIGINT_UNSIGNED_HANDLING_MODE, SNAPSHOT_DELAY_MS, SNAPSHOT_FETCH_SIZE, DDL_PARSER_MODE, ENABLE_TIME_ADJUSTER);
+                    SNAPSHOT_MODE, SNAPSHOT_LOCKING_MODE, SNAPSHOT_NEW_TABLES, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE,
+                    BIGINT_UNSIGNED_HANDLING_MODE, SNAPSHOT_DELAY_MS, SNAPSHOT_FETCH_SIZE, ENABLE_TIME_ADJUSTER);
         return config;
     }
 
@@ -1263,42 +1141,35 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
      */
     private static int validateSnapshotLockingMode(Configuration config, Field field, ValidationOutput problems) {
         // Determine which configurations are explicitly defined
-        final boolean isMinimalLockingExplicitlyDefined = config.hasKey(SNAPSHOT_MINIMAL_LOCKING.name());
-        final boolean isSnapshotModeExplicitlyDefined = config.hasKey(SNAPSHOT_LOCKING_MODE.name());
-
-        // If both configuration options are explicitly defined, we'll throw a validation error.
-        if (isMinimalLockingExplicitlyDefined && isSnapshotModeExplicitlyDefined) {
-            // Then display a validation error.
-            problems.accept(SNAPSHOT_MINIMAL_LOCKING,
-                            config.getBoolean(SNAPSHOT_MINIMAL_LOCKING),
-                            "Deprecated configuration " + SNAPSHOT_MINIMAL_LOCKING.name() + " in conflict. Cannot use both " + SNAPSHOT_MINIMAL_LOCKING.name() + " and " + SNAPSHOT_LOCKING_MODE.name() + " configuration options.");
-            return 1;
-        }
-
-        // Determine what value to use for SnapshotLockingMode
-        final SnapshotLockingMode lockingModeValue;
-
-        // if minimalLocking is defined
-        if (isMinimalLockingExplicitlyDefined) {
-            // Grab the configured minimal locks configuration option
-            final boolean minimalLocksEnabled = config.getBoolean(MySqlConnectorConfig.SNAPSHOT_MINIMAL_LOCKING);
-
-            // Coerce minimal locking => snapshot mode.
-            if (minimalLocksEnabled) {
-                lockingModeValue = SnapshotLockingMode.MINIMAL;
-            } else {
-                lockingModeValue = SnapshotLockingMode.EXTENDED;
+        if (config.hasKey(SNAPSHOT_LOCKING_MODE.name())) {
+            final SnapshotLockingMode lockingModeValue = SnapshotLockingMode.parse(
+                    config.getString(MySqlConnectorConfig.SNAPSHOT_LOCKING_MODE)
+            );
+            // Sanity check, validate the configured value is a valid option.
+            if (lockingModeValue == null) {
+                problems.accept(SNAPSHOT_LOCKING_MODE, lockingModeValue, "Must be a valid snapshot.locking.mode value");
+                return 1;
             }
-        } else {
-            // Otherwise use SnapshotLockingMode
-            // Grab explicitly configured value
-            lockingModeValue = SnapshotLockingMode.parse(config.getString(MySqlConnectorConfig.SNAPSHOT_LOCKING_MODE));
         }
 
-        // Sanity check, validate the configured value is a valid option.
-        if (lockingModeValue == null) {
-            problems.accept(SNAPSHOT_LOCKING_MODE, lockingModeValue, "Must be a valid snapshot.locking.mode value");
-            return 1;
+        // Everything checks out ok.
+        return 0;
+    }
+
+    /**
+     * Validate the time.precision.mode configuration.
+     *
+     * If {@code adaptive} is specified, this option has the potential to cause overflow which is why the
+     * option was deprecated and no longer supported for this connector.
+     */
+    private static int validateTimePrecisionMode(Configuration config, Field field, ValidationOutput problems) {
+        if (config.hasKey(TIME_PRECISION_MODE.name())) {
+            final String timePrecisionMode = config.getString(TIME_PRECISION_MODE.name());
+            if (TemporalPrecisionMode.ADAPTIVE.getValue().equals(timePrecisionMode)) {
+                // this is a problem
+                problems.accept(TIME_PRECISION_MODE, timePrecisionMode, "The 'adaptive' time.precision.mode is no longer supported");
+                return 1;
+            }
         }
 
         // Everything checks out ok.
@@ -1309,5 +1180,25 @@ public class MySqlConnectorConfig extends RelationalDatabaseConnectorConfig {
         int lowestServerId = 5400;
         int highestServerId = 6400;
         return lowestServerId + new Random().nextInt(highestServerId - lowestServerId);
+    }
+
+    @Override
+    protected SourceInfoStructMaker<? extends AbstractSourceInfo> getSourceInfoStructMaker(Version version) {
+        switch (version) {
+        case V1:
+            return new LegacyV1MySqlSourceInfoStructMaker(Module.name(), Module.version(), this);
+        default:
+            return new MySqlSourceInfoStructMaker(Module.name(), Module.version(), this);
+        }
+    }
+
+    @Override
+    public String getContextName() {
+        return Module.contextName();
+    }
+
+    @Override
+    public TemporalPrecisionMode getTemporalPrecisionMode() {
+        return temporalPrecisionMode;
     }
 }

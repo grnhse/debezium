@@ -13,10 +13,15 @@ import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import org.awaitility.Awaitility;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.SecureConnectionMode;
@@ -34,9 +39,10 @@ import io.debezium.relational.RelationalDatabaseConnectorConfig;
 public final class TestHelper {
 
     protected static final String TEST_SERVER = "test_server";
-    protected static final String TEST_DATABASE = "test_database";
+    protected static final String TEST_DATABASE = "postgres";
     protected static final String PK_FIELD = "pk";
     private static final String TEST_PROPERTY_PREFIX = "debezium.test.";
+    private static final Logger LOGGER = LoggerFactory.getLogger(TestHelper.class);
 
     /**
      * Key for schema parameter used to store DECIMAL/NUMERIC columns' precision.
@@ -71,12 +77,14 @@ public final class TestHelper {
      */
     public static ReplicationConnection createForReplication(String slotName, boolean dropOnClose) throws SQLException {
         final PostgresConnectorConfig.LogicalDecoder plugin = decoderPlugin();
+        final PostgresConnectorConfig config = new PostgresConnectorConfig(defaultConfig().build());
         return ReplicationConnection.builder(defaultJdbcConfig())
                                     .withPlugin(plugin)
                                     .withSlot(slotName)
                                     .withTypeRegistry(getTypeRegistry())
                                     .dropSlotOnClose(dropOnClose)
                                     .statusUpdateInterval(Duration.ofSeconds(10))
+                                    .withSchema(getSchema(config))
                                     .build();
     }
 
@@ -229,7 +237,72 @@ public final class TestHelper {
         return Boolean.parseBoolean(System.getProperty(TEST_PROPERTY_PREFIX + "ssl.failonconnect", "true"));
     }
 
-    protected static int waitTimeForRecords() {
+    public static int waitTimeForRecords() {
         return Integer.parseInt(System.getProperty(TEST_PROPERTY_PREFIX + "records.waittime", "2"));
+    }
+
+    protected static SourceInfo sourceInfo() {
+        return new SourceInfo( new PostgresConnectorConfig(
+                Configuration.create()
+                .with(PostgresConnectorConfig.SERVER_NAME, TEST_SERVER)
+                .with(PostgresConnectorConfig.DATABASE_NAME, TEST_DATABASE)
+                .build()));
+    }
+
+    protected static void dropDefaultReplicationSlot() {
+        try {
+            execute("SELECT pg_drop_replication_slot('" + ReplicationConnection.Builder.DEFAULT_SLOT_NAME + "')");
+        }
+        catch (Exception e) {
+            LOGGER.debug("Error while dropping default replication slot", e);
+        }
+    }
+
+    protected static void dropPublication() {
+        dropPublication(ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME);
+    }
+
+    protected static void dropPublication(String publicationName) {
+        if (decoderPlugin().equals(PostgresConnectorConfig.LogicalDecoder.PGOUTPUT)) {
+            try {
+                execute("DROP PUBLICATION " + publicationName);
+            }
+            catch (Exception e) {
+                LOGGER.debug("Error while dropping publication: '" + publicationName + "'", e);
+            }
+        }
+    }
+
+    protected static boolean publicationExists() {
+        return publicationExists(ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME);
+    }
+
+    protected static boolean publicationExists(String publicationName) {
+        if(decoderPlugin().equals(PostgresConnectorConfig.LogicalDecoder.PGOUTPUT)) {
+            try(PostgresConnection connection = create()) {
+                String query = String.format("SELECT pubname FROM pg_catalog.pg_publication WHERE pubname = '%s'", publicationName);
+                try {
+                    return connection.queryAndMap(query, ResultSet::next);
+                }
+                catch (SQLException e) {
+                    // ignored
+                }
+            }
+        }
+        return false;
+    }
+
+    protected static void waitForDefaultReplicationSlotBeActive() {
+        try (PostgresConnection connection = create()) {
+            Awaitility.await().atMost(org.awaitility.Duration.FIVE_SECONDS).until(() ->
+                connection.prepareQueryAndMap(
+                    "select * from pg_replication_slots where slot_name = ? and database = ? and plugin = ? and active = true", statement -> {
+                        statement.setString(1, ReplicationConnection.Builder.DEFAULT_SLOT_NAME);
+                        statement.setString(2, "postgres");
+                        statement.setString(3, TestHelper.decoderPlugin().getPostgresPluginName());
+                    },
+                    rs -> rs.next()
+               ));
+        }
     }
 }

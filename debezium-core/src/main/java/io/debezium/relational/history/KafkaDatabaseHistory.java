@@ -35,6 +35,7 @@ import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -61,6 +62,12 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
      * @see kafka.server.KafkaConfig.DefaultReplicationFactorProp
      */
     private static final String DEFAULT_TOPIC_REPLICATION_FACTOR_PROP_NAME = "default.replication.factor";
+
+    /**
+     * The default replication factor for the history topic which is used in case
+     * the value couldn't be retrieved from the broker.
+     */
+    private static final short DEFAULT_TOPIC_REPLICATION_FACTOR = 1;
 
     public static final Field TOPIC = Field.create(CONFIGURATION_FIELD_PREFIX_STRING + "kafka.topic")
                                            .withDisplayName("Database history topic name")
@@ -120,16 +127,16 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
     private Configuration producerConfig;
     private volatile KafkaProducer<String, String> producer;
     private int maxRecoveryAttempts;
-    private int pollIntervalMs = -1;
+    private Duration pollInterval;
 
     @Override
-    public void configure(Configuration config, HistoryRecordComparator comparator) {
-        super.configure(config, comparator);
+    public void configure(Configuration config, HistoryRecordComparator comparator, DatabaseHistoryListener listener) {
+        super.configure(config, comparator, listener);
         if (!config.validateAndRecord(ALL_FIELDS, logger::error)) {
             throw new ConnectException("Error configuring an instance of " + getClass().getSimpleName() + "; check the logs for details");
         }
         this.topicName = config.getString(TOPIC);
-        this.pollIntervalMs = config.getInteger(RECOVERY_POLL_INTERVAL_MS);
+        this.pollInterval = Duration.ofMillis(config.getInteger(RECOVERY_POLL_INTERVAL_MS));
         this.maxRecoveryAttempts = config.getInteger(RECOVERY_POLL_ATTEMPTS);
 
         String bootstrapServers = config.getString(BOOTSTRAP_SERVERS);
@@ -192,7 +199,7 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
             }
         } catch( InterruptedException e) {
             logger.trace("Interrupted before record was written into database history: {}", record);
-            Thread.interrupted();
+            Thread.currentThread().interrupt();
             throw new DatabaseHistoryException(e);
         } catch (ExecutionException e) {
             throw new DatabaseHistoryException(e);
@@ -201,7 +208,7 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
 
     @Override
     protected void recoverRecords(Consumer<HistoryRecord> records) {
-        try (KafkaConsumer<String, String> historyConsumer = new KafkaConsumer<>(consumerConfig.asProperties());) {
+        try (KafkaConsumer<String, String> historyConsumer = new KafkaConsumer<>(consumerConfig.asProperties())) {
             // Subscribe to the only partition for this topic, and seek to the beginning of that partition ...
             logger.debug("Subscribing to database history topic '{}'", topicName);
             historyConsumer.subscribe(Collect.arrayListOf(topicName));
@@ -220,7 +227,8 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
                 endOffset = getEndOffsetOfDbHistoryTopic(endOffset, historyConsumer);
                 logger.debug("End offset of database history topic is {}", endOffset);
 
-                ConsumerRecords<String, String> recoveredRecords = historyConsumer.poll(this.pollIntervalMs);
+                // DBZ-1361 not using poll(Duration) to keep compatibility with AK 1.x
+                ConsumerRecords<String, String> recoveredRecords = historyConsumer.poll(this.pollInterval.toMillis());
                 int numRecordsProcessed = 0;
 
                 for (ConsumerRecord<String, String> record : recoveredRecords) {
@@ -335,19 +343,9 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
         super.initializeStorage();
 
         try (AdminClient admin = AdminClient.create(this.producerConfig.asProperties())) {
+
             // Find default replication factor
-            Config brokerConfig = getKafkaBrokerConfig(admin);
-            String defaultReplicationFactorValue = brokerConfig.get(DEFAULT_TOPIC_REPLICATION_FACTOR_PROP_NAME).value();
-            final short replicationFactor;
-            // Ensure that the default replication factor property was returned by the Admin Client
-            if (defaultReplicationFactorValue != null) {
-                replicationFactor = Short.parseShort(defaultReplicationFactorValue);
-            }
-            else {
-                // Otherwise warn that no property was obtained and default it to 1 - users can increase this later if desired
-                logger.warn("Unable to obtain the default replication factor from the brokers at {} - Setting value to 1 instead", producerConfig.getString(BOOTSTRAP_SERVERS));
-                replicationFactor = 1;
-            }
+            final short replicationFactor = getDefaultTopicReplicationFactor(admin);
 
             // Create topic
             final NewTopic topic = new NewTopic(topicName, (short) 1, replicationFactor);
@@ -359,6 +357,33 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
         catch (Exception e) {
             throw new ConnectException("Creation of database history topic failed, please create the topic manually", e);
         }
+    }
+
+    private short getDefaultTopicReplicationFactor(AdminClient admin) throws Exception {
+        try {
+            Config brokerConfig = getKafkaBrokerConfig(admin);
+            String defaultReplicationFactorValue = brokerConfig.get(DEFAULT_TOPIC_REPLICATION_FACTOR_PROP_NAME).value();
+
+            // Ensure that the default replication factor property was returned by the Admin Client
+            if (defaultReplicationFactorValue != null) {
+                return Short.parseShort(defaultReplicationFactorValue);
+            }
+        }
+        catch (ExecutionException ex) {
+            // ignore UnsupportedVersionException, e.g. due to older broker version
+            if (!(ex.getCause() instanceof UnsupportedVersionException)) {
+                throw ex;
+            }
+        }
+
+        // Otherwise warn that no property was obtained and default it to 1 - users can increase this later if desired
+        logger.warn(
+                "Unable to obtain the default replication factor from the brokers at {}. Setting value to {} instead.",
+                producerConfig.getString(BOOTSTRAP_SERVERS),
+                DEFAULT_TOPIC_REPLICATION_FACTOR
+        );
+
+        return DEFAULT_TOPIC_REPLICATION_FACTOR;
     }
 
     private Config getKafkaBrokerConfig(AdminClient admin) throws Exception {
@@ -379,4 +404,5 @@ public class KafkaDatabaseHistory extends AbstractDatabaseHistory {
 
         return configs.values().iterator().next();
     }
+
 }

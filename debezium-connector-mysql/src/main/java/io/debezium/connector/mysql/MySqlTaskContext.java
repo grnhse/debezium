@@ -12,7 +12,6 @@ import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
@@ -58,7 +57,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
     }
 
     public MySqlTaskContext(Configuration config, Filters filters, Boolean tableIdCaseInsensitive, Map<String, ?> restartOffset) {
-        super("MySQL", config.getString(MySqlConnectorConfig.SERVER_NAME), Collections::emptyList);
+        super(Module.contextName(), config.getString(MySqlConnectorConfig.SERVER_NAME), Collections::emptyList);
 
         this.config = config;
         this.connectorConfig = new MySqlConnectorConfig(config);
@@ -68,8 +67,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
         this.topicSelector = MySqlTopicSelector.defaultSelector(connectorConfig.getLogicalName(), connectorConfig.getHeartbeatTopicsPrefix());
 
         // Set up the source information ...
-        this.source = new SourceInfo();
-        this.source.setServerName(connectorConfig.getLogicalName());
+        this.source = new SourceInfo(connectorConfig);
 
         // Set up the GTID filter ...
         String gtidSetIncludes = config.getString(MySqlConnectorConfig.GTID_SOURCE_INCLUDES);
@@ -87,7 +85,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
         this.dbSchema = new MySqlSchema(connectorConfig, this.gtidSourceFilter, this.tableIdCaseInsensitive, topicSelector, filters);
 
         // Set up the record processor ...
-        this.recordProcessor = new RecordMakers(dbSchema, source, topicSelector, config.getBoolean(CommonConnectorConfig.TOMBSTONES_ON_DELETE), restartOffset);
+        this.recordProcessor = new RecordMakers(dbSchema, source, topicSelector, connectorConfig.isEmitTombstoneOnDelete(), restartOffset);
 
         // Set up the DDL filter
         final String ddlFilter = config.getString(DatabaseHistory.DDL_FILTER);
@@ -243,10 +241,6 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
     protected SnapshotMode snapshotMode() {
         String value = config.getString(MySqlConnectorConfig.SNAPSHOT_MODE);
         return SnapshotMode.parse(value, MySqlConnectorConfig.SNAPSHOT_MODE.defaultValueAsString());
-    }
-
-    public String getSnapshotSelectOverrides() {
-        return config.getString(MySqlConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE);
     }
 
     public void start() {

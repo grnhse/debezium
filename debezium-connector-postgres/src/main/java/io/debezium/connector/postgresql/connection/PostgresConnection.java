@@ -19,7 +19,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
-import io.debezium.connector.postgresql.spi.SlotState;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
 import org.postgresql.core.TypeInfo;
@@ -30,9 +29,11 @@ import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.config.Configuration;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.TypeRegistry;
+import io.debezium.connector.postgresql.spi.SlotState;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.TableId;
@@ -82,11 +83,18 @@ public class PostgresConnection extends JdbcConnection {
     public PostgresConnection(Configuration config) {
         super(config, FACTORY, PostgresConnection::validateServerVersion, PostgresConnection::defaultSettings);
 
+        Connection pgConnection = null;
         try {
-            typeRegistry = initTypeRegistry(connection());
+            pgConnection = connection();
+            typeRegistry = initTypeRegistry(pgConnection);
         }
         catch (SQLException e) {
-            throw new ConnectException("Could not initialize type registry", e);
+            if (pgConnection == null) {
+                throw new ConnectException("Could not create PG connection", e);
+            }
+            else {
+                throw new ConnectException("Could not initialize type registry", e);
+            }
         }
 
         databaseCharset = determineDatabaseCharset();
@@ -136,13 +144,20 @@ public class PostgresConnection extends JdbcConnection {
      * @return the {@link SlotState} or null, if no slot state is found
      * @throws SQLException
      */
-    public SlotState getReplicationSlotInfo(String slotName, String pluginName) throws SQLException {
-        ServerInfo.ReplicationSlot slot = fetchReplicationSlotInfo(slotName, pluginName);
-        if (slot.equals(ServerInfo.ReplicationSlot.INVALID)) {
-            return null;
+    public SlotState getReplicationSlotState(String slotName, String pluginName) throws SQLException {
+        ServerInfo.ReplicationSlot slot;
+        try {
+            slot = readReplicationSlotInfo(slotName, pluginName);
+            if (slot.equals(ServerInfo.ReplicationSlot.INVALID)) {
+                return null;
+            }
+            else {
+                return slot.asSlotState();
+            }
         }
-        else {
-            return slot.asSlotState();
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ConnectException("Interrupted while waiting for valid replication slot info", e);
         }
     }
 
@@ -154,7 +169,7 @@ public class PostgresConnection extends JdbcConnection {
      *         the slot is not valid
      * @throws SQLException is thrown by the underlying JDBC
      */
-    protected ServerInfo.ReplicationSlot fetchReplicationSlotInfo(String slotName, String pluginName) throws SQLException {
+    private ServerInfo.ReplicationSlot fetchReplicationSlotInfo(String slotName, String pluginName) throws SQLException {
         final String database = database();
         final ServerInfo.ReplicationSlot slot = queryForSlot(slotName, database, pluginName,
                 rs -> {
@@ -185,7 +200,7 @@ public class PostgresConnection extends JdbcConnection {
      * Fetches a replication slot, repeating the query until either the slot is created or until
      * the max number of attempts has been reached
      *
-     * To fetch the slot without teh retries, use the {@link PostgresConnection#fetchReplicationSlotInfo} call
+     * To fetch the slot without the retries, use the {@link PostgresConnection#fetchReplicationSlotInfo} call
      * @param slotName the slot name
      * @param pluginName the name of the plugin
      * @return the {@link ServerInfo.ReplicationSlot} object or a {@link ServerInfo.ReplicationSlot#INVALID} if
@@ -193,7 +208,8 @@ public class PostgresConnection extends JdbcConnection {
      * @throws SQLException is thrown by the underyling jdbc driver
      * @throws InterruptedException is thrown if we don't return an answer within the set number of retries
      */
-    protected ServerInfo.ReplicationSlot readReplicationSlotInfo(String slotName, String pluginName) throws SQLException, InterruptedException {
+    @VisibleForTesting
+    ServerInfo.ReplicationSlot readReplicationSlotInfo(String slotName, String pluginName) throws SQLException, InterruptedException {
         final String database = database();
         final Metronome metronome = Metronome.parker(PAUSE_BETWEEN_REPLICATION_SLOT_RETRIEVAL_ATTEMPTS, Clock.SYSTEM);
 
@@ -300,6 +316,29 @@ public class PostgresConnection extends JdbcConnection {
             }
             else {
                 LOGGER.error("Unexpected error while attempting to drop replication slot", e);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Drops the debezium publication that was created.
+     *
+     * @param publicationName the publication name, may not be null
+     * @return {@code true} if the publication was dropped, {@code false} otherwise
+     */
+    public boolean dropPublication(String publicationName) {
+        try {
+            LOGGER.debug("Dropping publication '{}'", publicationName);
+            execute("DROP PUBLICATION " + publicationName);
+            return true;
+        }
+        catch (SQLException e) {
+            if (PSQLState.UNDEFINED_OBJECT.getState().equals(e.getSQLState())) {
+                LOGGER.debug("Publication {} has already been dropped", publicationName);
+            }
+            else {
+                LOGGER.error("Unexpected error while attempting to drop publication", e);
             }
             return false;
         }
@@ -452,7 +491,7 @@ public class PostgresConnection extends JdbcConnection {
             }
         }
         catch (SQLException e) {
-            throw new ConnectException("Could not intialize type registry", e);
+            throw new ConnectException("Database connection failed during intializiation of the type registry", e);
         }
         return typeRegistryBuilder.build();
     }

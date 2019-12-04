@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.bson.BsonTimestamp;
@@ -38,10 +39,13 @@ import com.mongodb.client.model.Filters;
 import io.debezium.annotation.ThreadSafe;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.ConfigurationDefaults;
+import io.debezium.connector.SnapshotRecord;
 import io.debezium.connector.mongodb.MongoDbConnectorConfig.SnapshotMode;
 import io.debezium.connector.mongodb.RecordMakers.RecordsForCollection;
+import io.debezium.data.Envelope;
 import io.debezium.function.BlockingConsumer;
 import io.debezium.function.BufferedBlockingConsumer;
+import io.debezium.heartbeat.Heartbeat;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 import io.debezium.util.Strings;
@@ -90,7 +94,7 @@ import io.debezium.util.Threads;
 @ThreadSafe
 public class Replicator {
 
-    private final Logger logger = LoggerFactory.getLogger(getClass());
+    private static final Logger LOGGER = LoggerFactory.getLogger(Replicator.class);
 
     private static final String AUTHORIZATION_FAILURE_MESSAGE = "Command failed with error 13";
 
@@ -105,6 +109,7 @@ public class Replicator {
     private final Clock clock;
     private ConnectionContext.MongoPrimary primaryClient;
     private final Consumer<Throwable> onFailure;
+    private final Heartbeat heartbeat;
 
     /**
      * @param context the replication context; may not be null
@@ -123,9 +128,12 @@ public class Replicator {
         final String copyThreadName = "copy-" + (replicaSet.hasReplicaSetName() ? replicaSet.replicaSetName() : "main");
         this.copyThreads = Threads.newFixedThreadPool(MongoDbConnector.class, context.serverName(), copyThreadName, context.getConnectionContext().maxNumberOfCopyThreads());
         this.bufferedRecorder = new BufferableRecorder(recorder);
-        this.recordMakers = new RecordMakers(context.filters(), this.source, context.topicSelector(), this.bufferedRecorder, context.isEmitTombstoneOnDelete());
+        this.recordMakers = new RecordMakers(context.filters(), this.source, context.topicSelector(), this.bufferedRecorder, context.getConnectorConfig().isEmitTombstoneOnDelete());
         this.clock = this.context.getClock();
         this.onFailure = onFailure;
+
+        heartbeat = Heartbeat.create(context.getConnectorConfig().getConfig(), context.topicSelector().getHeartbeatTopic(),
+                context.getConnectorConfig().getLogicalName());
     }
 
     /**
@@ -158,7 +166,7 @@ public class Replicator {
                 }
             }
             catch (Throwable t) {
-                logger.error("Replicator for replica set {} failed", rsName, t);
+                LOGGER.error("Replicator for replica set {} failed", rsName, t);
                 onFailure.accept(t);
             }
             finally {
@@ -176,7 +184,7 @@ public class Replicator {
      * @return {@code true} if a connection was established, or {@code false} otherwise
      */
     protected boolean establishConnectionToPrimary() {
-        logger.info("Connecting to '{}'", replicaSet);
+        LOGGER.info("Connecting to '{}'", replicaSet);
         primaryClient = context.getConnectionContext().primaryFor(
                 replicaSet,
                 context.filters(),
@@ -186,7 +194,7 @@ public class Replicator {
                         throw new ConnectException("Error while attempting to " + desc, error);
                     }
                     else {
-                        logger.error("Error while attempting to {}: {}", desc, error.getMessage(), error);
+                        LOGGER.error("Error while attempting to {}: {}", desc, error.getMessage(), error);
                     }
                 });
 
@@ -200,7 +208,7 @@ public class Replicator {
         primaryClient.execute("get oplog position", primary -> {
             MongoCollection<Document> oplog = primary.getDatabase("local").getCollection("oplog.rs");
             Document last = oplog.find().sort(new Document("$natural", -1)).limit(1).first(); // may be null
-            source.offsetStructForEvent(replicaSet.replicaSetName(), last);
+            source.opLogEvent(replicaSet.replicaSetName(), last);
         });
     }
 
@@ -214,17 +222,17 @@ public class Replicator {
     protected boolean isInitialSyncExpected() {
         boolean performSnapshot = true;
         if (source.hasOffset(rsName)) {
-            if (logger.isInfoEnabled()) {
-                logger.info("Found existing offset for replica set '{}' at {}", rsName, source.lastOffset(rsName));
+            if (LOGGER.isInfoEnabled()) {
+                LOGGER.info("Found existing offset for replica set '{}' at {}", rsName, source.lastOffset(rsName));
             }
             performSnapshot = false;
             if (context.getConnectionContext().performSnapshotEvenIfNotNeeded()) {
-                logger.info("Configured to performing initial sync of replica set '{}'", rsName);
+                LOGGER.info("Configured to performing initial sync of replica set '{}'", rsName);
                 performSnapshot = true;
             } else {
                 if (source.isInitialSyncOngoing(rsName)) {
                     // The last snapshot was not completed, so do it again ...
-                    logger.info("The previous initial sync was incomplete for '{}', so initiating another initial sync", rsName);
+                    LOGGER.info("The previous initial sync was incomplete for '{}', so initiating another initial sync", rsName);
                     performSnapshot = true;
                 } else {
                     // There is no ongoing initial sync, so look to see if our last recorded offset still exists in the oplog.
@@ -237,23 +245,23 @@ public class Replicator {
                     });
 
                     if (firstAvailableTs == null) {
-                        logger.info("The oplog contains no entries, so performing initial sync of replica set '{}'", rsName);
+                        LOGGER.info("The oplog contains no entries, so performing initial sync of replica set '{}'", rsName);
                         performSnapshot = true;
                     } else if (lastRecordedTs.compareTo(firstAvailableTs) < 0) {
                         // The last recorded timestamp is *before* the first existing oplog event, which means there is
                         // almost certainly some history lost since we last processed the oplog ...
-                        logger.info("Initial sync is required since the oplog for replica set '{}' starts at {}, which is later than the timestamp of the last offset {}",
+                        LOGGER.info("Initial sync is required since the oplog for replica set '{}' starts at {}, which is later than the timestamp of the last offset {}",
                                     rsName, firstAvailableTs, lastRecordedTs);
                         performSnapshot = true;
                     } else {
                         // Otherwise we'll not perform an initial sync
-                        logger.info("The oplog contains the last entry previously read for '{}', so no initial sync will be performed",
+                        LOGGER.info("The oplog contains the last entry previously read for '{}', so no initial sync will be performed",
                                     rsName);
                     }
                 }
             }
         } else {
-            logger.info("No existing offset found for replica set '{}', starting initial sync", rsName);
+            LOGGER.info("No existing offset found for replica set '{}', starting initial sync", rsName);
             performSnapshot = true;
         }
         return performSnapshot;
@@ -269,12 +277,12 @@ public class Replicator {
             delaySnapshotIfNeeded();
         }
         catch (InterruptedException e) {
-            logger.info("Interrupted while awaiting initial snapshot delay");
+            LOGGER.info("Interrupted while awaiting initial snapshot delay");
             return false;
         }
 
-        if (logger.isInfoEnabled()) {
-            logger.info("Beginning initial sync of '{}' at {}", rsName, source.lastOffset(rsName));
+        if (LOGGER.isInfoEnabled()) {
+            LOGGER.info("Beginning initial sync of '{}' at {}", rsName, source.lastOffset(rsName));
         }
         source.startInitialSync(replicaSet.replicaSetName());
 
@@ -283,7 +291,7 @@ public class Replicator {
             bufferedRecorder.startBuffering();
         } catch (InterruptedException e) {
             // Do nothing so that this thread is terminated ...
-            logger.info("Interrupted while waiting to flush the buffer before starting an initial sync of '{}'", rsName);
+            LOGGER.info("Interrupted while waiting to flush the buffer before starting an initial sync of '{}'", rsName);
             return false;
         }
 
@@ -301,8 +309,8 @@ public class Replicator {
         final AtomicLong numDocumentsCopied = new AtomicLong();
 
         // And start threads to pull collection IDs from the queue and perform the copies ...
-        if (logger.isInfoEnabled()) {
-            logger.info("Preparing to use {} thread(s) to sync {} collection(s): {}",
+        if (LOGGER.isInfoEnabled()) {
+            LOGGER.info("Preparing to use {} thread(s) to sync {} collection(s): {}",
                         numThreads, collections.size(), Strings.join(", ", collections));
         }
         for (int i = 0; i != numThreads; ++i) {
@@ -313,13 +321,13 @@ public class Replicator {
                     CollectionId id = null;
                     while (!aborted.get() && (id = collectionsToCopy.poll()) != null) {
                         long start = clock.currentTimeInMillis();
-                        logger.info("Starting initial sync of '{}'", id);
+                        LOGGER.info("Starting initial sync of '{}'", id);
                         long numDocs = copyCollection(id, syncStart);
                         numCollectionsCopied.incrementAndGet();
                         numDocumentsCopied.addAndGet(numDocs);
-                        if (logger.isInfoEnabled()) {
+                        if (LOGGER.isInfoEnabled()) {
                             long duration = clock.currentTimeInMillis() - start;
-                            logger.info("Completing initial sync of {} documents from '{}' in {}", numDocs, id, Strings.duration(duration));
+                            LOGGER.info("Completing initial sync of {} documents from '{}' in {}", numDocs, id, Strings.duration(duration));
                         }
                     }
                 } catch (InterruptedException e) {
@@ -335,7 +343,7 @@ public class Replicator {
         try {
             latch.await();
         } catch (InterruptedException e) {
-            Thread.interrupted();
+            Thread.currentThread().interrupt();
             aborted.set(true);
         }
         this.copyThreads.shutdown();
@@ -344,9 +352,9 @@ public class Replicator {
         // Therefore, check the aborted state here ...
         long syncDuration = clock.currentTimeInMillis() - syncStart;
         if (aborted.get()) {
-            if (logger.isInfoEnabled()) {
+            if (LOGGER.isInfoEnabled()) {
                 int remaining = collections.size() - numCollectionsCopied.get();
-                logger.info("Initial sync aborted after {} with {} of {} collections incomplete",
+                LOGGER.info("Initial sync aborted after {} with {} of {} collections incomplete",
                             Strings.duration(syncDuration), remaining, collections.size());
             }
             return false;
@@ -358,12 +366,16 @@ public class Replicator {
             // And immediately flush the last buffered source record with the updated offset ...
             bufferedRecorder.stopBuffering(source.lastOffset(rsName));
         } catch (InterruptedException e) {
-            logger.info("Interrupted while waiting for last initial sync record from replica set '{}' to be recorded", rsName);
+            LOGGER.info("Interrupted while waiting for last initial sync record from replica set '{}' to be recorded", rsName);
             return false;
         }
 
-        if (logger.isInfoEnabled()) {
-            logger.info("Initial sync of {} collections with a total of {} documents completed in {}",
+        if (collections.isEmpty()) {
+            LOGGER.warn("After applying blacklist/whitelist filters there are no tables to monitor, please check your configuration");
+        }
+
+        if (LOGGER.isInfoEnabled()) {
+            LOGGER.info("Initial sync of {} collections with a total of {} documents completed in {}",
                         collections.size(), numDocumentsCopied.get(), Strings.duration(syncDuration));
         }
         return true;
@@ -383,7 +395,7 @@ public class Replicator {
                 throw new InterruptedException("Interrupted while awaiting initial snapshot delay");
             }
 
-            logger.info("The connector will wait for {}s before proceeding", timer.remaining().getSeconds());
+            LOGGER.info("The connector will wait for {}s before proceeding", timer.remaining().getSeconds());
             metronome.pause();
         }
     }
@@ -422,7 +434,7 @@ public class Replicator {
         try (MongoCursor<Document> cursor = docCollection.find().batchSize(batchSize).iterator()) {
             while (running.get() && cursor.hasNext()) {
                 Document doc = cursor.next();
-                logger.trace("Found existing doc in {}: {}", collectionId, doc);
+                LOGGER.trace("Found existing doc in {}: {}", collectionId, doc);
                 counter += factory.recordObject(collectionId, doc, timestamp);
             }
         }
@@ -447,7 +459,7 @@ public class Replicator {
     protected void readOplog(MongoClient primary) {
         BsonTimestamp oplogStart = source.lastOffsetTimestamp(replicaSet.replicaSetName());
         ServerAddress primaryAddress = primary.getAddress();
-        logger.info("Reading oplog for '{}' primary {} starting at {}", replicaSet, primaryAddress, oplogStart);
+        LOGGER.info("Reading oplog for '{}' primary {} starting at {}", replicaSet, primaryAddress, oplogStart);
 
         // Include none of the cluster-internal operations and only those events since the previous timestamp ...
         MongoCollection<Document> oplog = primary.getDatabase("local").getCollection("oplog.rs");
@@ -460,8 +472,24 @@ public class Replicator {
         // Read as much of the oplog as we can ...
         try (MongoCursor<Document> cursor = results.iterator()) {
             while (running.get() && cursor.hasNext()) {
-                if (!handleOplogEvent(primaryAddress, cursor.next())) {
+                final Document event = cursor.next();
+                if (!handleOplogEvent(primaryAddress, event)) {
                     // Something happened, and we're supposed to stop reading
+                    return;
+                }
+                try {
+                    heartbeat.heartbeat(source.partition(replicaSet.replicaSetName()), () -> {
+                            // note opLogEvent() will have been called before via handleOplogEvent()
+                            // (unless the event is filtered out), but that's ok, as it's idempotent
+                            // and the code here is only actually is executed if a heartbeat is due
+                            source.opLogEvent(replicaSet.replicaSetName(), event);
+                            return source.lastOffset(replicaSet.replicaSetName());
+                        },
+                        bufferedRecorder);
+                }
+                catch (InterruptedException e) {
+                    LOGGER.info("Replicator thread is interrupted");
+                    Thread.currentThread().interrupt();
                     return;
                 }
             }
@@ -477,12 +505,12 @@ public class Replicator {
      *         processing events
      */
     protected boolean handleOplogEvent(ServerAddress primaryAddress, Document event) {
-        logger.debug("Found event: {}", event);
+        LOGGER.debug("Found event: {}", event);
         String ns = event.getString("ns");
         Document object = event.get("o", Document.class);
         if (object == null) {
-            if (logger.isWarnEnabled()) {
-                logger.warn("Missing 'o' field in event, so skipping {}", event.toJson());
+            if (LOGGER.isWarnEnabled()) {
+                LOGGER.warn("Missing 'o' field in event, so skipping {}", event.toJson());
             }
             return true;
         }
@@ -497,25 +525,33 @@ public class Replicator {
                         address.set(currentPrimary);
                     });
                 } catch (InterruptedException e) {
-                    logger.error("Get current primary executeBlocking", e);
+                    LOGGER.error("Get current primary executeBlocking", e);
                 }
                 ServerAddress serverAddress = address.get();
 
                 //primary switch will be handled automatically by MongoDB driver
                 if (serverAddress != null && !serverAddress.equals(primaryAddress)) {
-                    logger.info("Found new primary event in oplog, so stopping use of {} to continue with new primary {}",
+                    LOGGER.info("Found new primary event in oplog, so stopping use of {} to continue with new primary {}",
                             primaryAddress, serverAddress);
                 } else {
-                    logger.info("Found new primary event in oplog, current {} is new primary. " +
+                    LOGGER.info("Found new primary event in oplog, current {} is new primary. " +
                                 "Continue to process oplog event.", primaryAddress);
                 }
             }
             // Otherwise, ignore this event ...
-            if (logger.isDebugEnabled()) {
-                logger.debug("Skipping event with no namespace: {}", event.toJson());
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Skipping event with no namespace: {}", event.toJson());
             }
             return true;
         }
+
+        String operation = event.getString("op");
+        // the op is not insert/update/delete
+        if (!RecordMakers.isValidOperation(operation)) {
+            LOGGER.debug("Skipping event with \"op={}\"", operation);
+            return true;
+        }
+
         int delimIndex = ns.indexOf('.');
         if (delimIndex > 0) {
             assert (delimIndex + 1) < ns.length();
@@ -524,12 +560,12 @@ public class Replicator {
             if ("$cmd".equals(collectionName)) {
                 // This is a command on a database ...
                 // TODO: Probably want to handle some of these when we track creation/removal of collections
-                logger.debug("Skipping database command event: {}", event.toJson());
+                LOGGER.debug("Skipping database command event: {}", event.toJson());
                 return true;
             }
             // Otherwise, it is an event on a document in a collection ...
             if (!context.filters().databaseFilter().test(dbName)) {
-                logger.debug("Skipping the event for database {} based on database.whitelist", dbName);
+                LOGGER.debug("Skipping the event for database {} based on database.whitelist", dbName);
                 return true;
             }
             CollectionId collectionId = new CollectionId(rsName, dbName, collectionName);
@@ -538,7 +574,7 @@ public class Replicator {
                 try {
                     factory.recordEvent(event, clock.currentTimeInMillis());
                 } catch (InterruptedException e) {
-                    Thread.interrupted();
+                    Thread.currentThread().interrupt();
                     return false;
                 }
             }
@@ -585,6 +621,11 @@ public class Replicator {
             this.buffered.close(record -> {
                 if (record == null) {
                     return null;
+                }
+                final Struct envelope = (Struct) record.value();
+                final Struct source = (Struct) envelope.get(Envelope.FieldName.SOURCE);
+                if (SnapshotRecord.fromSource(source) == SnapshotRecord.TRUE) {
+                    SnapshotRecord.LAST.toSource(source);
                 }
                 return new SourceRecord(record.sourcePartition(),
                         newOffset,

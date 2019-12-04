@@ -29,19 +29,16 @@ import org.apache.kafka.connect.data.Struct;
 import org.fest.assertions.Delta;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TestRule;
 
 import io.debezium.config.Configuration;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SnapshotMode;
-import io.debezium.connector.mysql.junit.SkipForLegacyParser;
-import io.debezium.connector.mysql.junit.SkipTestForLegacyParser;
 import io.debezium.data.Envelope;
 import io.debezium.doc.FixFor;
 import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.RelationalDatabaseConnectorConfig.DecimalHandlingMode;
+import io.debezium.relational.history.DatabaseHistory;
 import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.Testing;
 
@@ -57,9 +54,6 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
     private static final TemporalAdjuster ADJUSTER = MySqlValueConverters::adjustTemporal;
 
     private Configuration config;
-
-    @Rule
-    public final TestRule skip = new SkipTestForLegacyParser();
 
     @Before
     public void beforeEach() {
@@ -80,7 +74,6 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
 
     @Test
     @FixFor("DBZ-61")
-    @SkipForLegacyParser
     public void shouldConsumeAllEventsFromDatabaseUsingBinlogAndNoSnapshot() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
@@ -96,8 +89,8 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         // ---------------------------------------------------------------------------------------------------------------
         // Testing.Debug.enable();
         int numCreateDatabase = 1;
-        int numCreateTables = 11;
-        int numDataRecords = 20;
+        int numCreateTables = 12;
+        int numDataRecords = 22;
         int numCreateDefiner = 1;
         SourceRecords records =
             consumeRecordsByTopic(numCreateDatabase + numCreateTables + numDataRecords + numCreateDefiner);
@@ -111,6 +104,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_100_enumsettest")).size()).isEqualTo(3);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_102_charsettest")).size()).isEqualTo(1);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_114_zerovaluetest")).size()).isEqualTo(2);
+        assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).size()).isEqualTo(2);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_123_bitvaluetest")).size()).isEqualTo(2);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_104_customers")).size()).isEqualTo(4);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_147_decimalvalues")).size()).isEqualTo(1);
@@ -122,7 +116,6 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         assertThat(records.ddlRecordsForDatabase("connector_test")).isNull();
         assertThat(records.ddlRecordsForDatabase("readbinlog_test")).isNull();
         records.ddlRecordsForDatabase(DATABASE.getDatabaseName()).forEach(this::print);
-
         // Check that all records are valid, can be serialized and deserialized ...
         records.forEach(this::validate);
         records.forEach(record -> {
@@ -336,11 +329,27 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
                 assertThat(c5Time).isEqualTo(Duration.ofHours(-838).minusMinutes(59).minusSeconds(58).minusNanos(999999000));
             }
         });
+
+        final Struct rec1 = ((Struct) records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).get(0).value()).getStruct("after");
+        final Struct rec2 = ((Struct) records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).get(1).value()).getStruct("after");
+        assertThat(rec1.get("c1")).isNull();
+        assertThat(rec1.get("c2")).isEqualTo(0L);
+        assertThat(rec1.get("c3")).isNull();
+        assertThat(rec1.get("c4")).isEqualTo("1970-01-01T00:00:00Z");
+        assertThat(rec1.get("nnc1")).isEqualTo(0);
+        assertThat(rec1.get("nnc2")).isEqualTo(0L);
+        assertThat(rec1.get("nnc3")).isEqualTo(0L);
+        assertThat(rec2.get("c1")).isNull();
+        assertThat(rec2.get("c2")).isEqualTo(60_000_000L); // 1 minute
+        assertThat(rec2.get("c3")).isNull();
+        assertThat(rec2.get("c4")).isEqualTo("1970-01-01T00:00:00Z");
+        assertThat(rec2.get("nnc1")).isEqualTo(0);
+        assertThat(rec2.get("nnc2")).isEqualTo(60_000_000L); // 1 minute
+        assertThat(rec2.get("nnc3")).isEqualTo(0L);
     }
 
     @Test
     @FixFor("DBZ-61")
-    @SkipForLegacyParser
     public void shouldConsumeAllEventsFromDatabaseUsingBinlogAndNoSnapshotAndConnectTimesTypes() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
@@ -358,8 +367,8 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         // ---------------------------------------------------------------------------------------------------------------
         // Testing.Debug.enable();
         int numCreateDatabase = 1;
-        int numCreateTables = 11;
-        int numDataRecords = 20;
+        int numCreateTables = 12;
+        int numDataRecords = 22;
         int numCreateDefiner = 1;
         SourceRecords records =
                 consumeRecordsByTopic(numCreateDatabase + numCreateTables + numDataRecords + numCreateDefiner);
@@ -424,12 +433,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
 
                 // '17:51:04.777'
                 java.util.Date c2 = (java.util.Date) after.get("c2"); // milliseconds past midnight
-                LocalTime c2Time = LocalTime.ofNanoOfDay(TimeUnit.MILLISECONDS.toNanos(c2.getTime()));
-                assertThat(c2Time.getHour()).isEqualTo(17);
-                assertThat(c2Time.getMinute()).isEqualTo(51);
-                assertThat(c2Time.getSecond()).isEqualTo(4);
-                assertThat(c2Time.getNano()).isEqualTo((int) TimeUnit.MILLISECONDS.toNanos(780));
-                assertThat(io.debezium.time.Time.toMilliOfDay(c2Time, ADJUSTER)).isEqualTo((int) c2.getTime());
+                assertThat(c2.toInstant()).isEqualTo(LocalDateTime.of(1970, 1, 1, 17, 51, 4, 780_000_000).atOffset(ZoneOffset.UTC).toInstant());
 
                 // '2014-09-08 17:51:04.777'
                 // DATETIME is a logical date and time, it doesn't contain any TZ information;
@@ -485,7 +489,6 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
                 assertThat(c2Time.getMinute() == 0 || c2Time.getMinute() == 1).isTrue();
                 assertThat(c2Time.getSecond()).isEqualTo(0);
                 assertThat(c2Time.getNano()).isEqualTo(0);
-                assertThat(io.debezium.time.Time.toMilliOfDay(c2Time, ADJUSTER)).isEqualTo((int) c2.getTime());
 
                 java.util.Date c3 = (java.util.Date) after.get("c3"); // epoch millis
                 assertThat(c3).isNull();
@@ -558,8 +561,8 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         // Consume all of the events due to startup and initialization of the database
         // ---------------------------------------------------------------------------------------------------------------
         // Testing.Debug.enable();
-        int numTables = 11;
-        int numDataRecords = 20;
+        int numTables = 12;
+        int numDataRecords = 22;
         int numDdlRecords = numTables * 2 + 3; // for each table (1 drop + 1 create) + for each db (1 create + 1 drop + 1 use)
         int numCreateDefiner = 1;
         int numSetVariables = 1;
@@ -575,6 +578,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_100_enumsettest")).size()).isEqualTo(3);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_102_charsettest")).size()).isEqualTo(1);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_114_zerovaluetest")).size()).isEqualTo(2);
+        assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).size()).isEqualTo(2);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_123_bitvaluetest")).size()).isEqualTo(2);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_104_customers")).size()).isEqualTo(4);
         assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_147_decimalvalues")).size()).isEqualTo(1);
@@ -779,11 +783,29 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
                 assertThat(c5Time).isEqualTo(Duration.ofHours(-838).minusMinutes(59).minusSeconds(58).minusNanos(999999000));
             }
         });
+
+        try (MySQLConnection conn = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());) {
+            final Struct rec1 = ((Struct) records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).get(0).value()).getStruct("after");
+            final Struct rec2 = ((Struct) records.recordsForTopic(DATABASE.topicForTable("dbz_1318_zerovaluetest")).get(1).value()).getStruct("after");
+            assertThat(rec1.get("c1")).isNull();
+            assertThat(rec1.get("c2")).isEqualTo(0L);
+            assertThat(rec1.get("c3")).isNull();
+            assertThat(rec1.get("c4")).isEqualTo(conn.databaseAsserts().currentDateTimeDefaultOptional("1970-01-01T00:00:00Z"));
+            assertThat(rec1.get("nnc1")).isEqualTo(0);
+            assertThat(rec1.get("nnc2")).isEqualTo(0L);
+            assertThat(rec1.get("nnc3")).isEqualTo(0L);
+            assertThat(rec2.get("c1")).isNull();
+            assertThat(rec2.get("c2")).isEqualTo(60_000_000L); // 1 minute
+            assertThat(rec2.get("c3")).isNull();
+            assertThat(rec2.get("c4")).isEqualTo(conn.databaseAsserts().currentDateTimeDefaultOptional("1970-01-01T00:00:00Z"));
+            assertThat(rec2.get("nnc1")).isEqualTo(0);
+            assertThat(rec2.get("nnc2")).isEqualTo(60_000_000L); // 1 minute
+            assertThat(rec2.get("nnc3")).isEqualTo(0L);
+        }
     }
 
     @Test
     @FixFor("DBZ-147")
-    @SkipForLegacyParser
     public void shouldConsumeAllEventsFromDecimalTableInDatabaseUsingBinlogAndNoSnapshot() throws SQLException, InterruptedException {
         // Use the DB configuration to define the connector's configuration ...
         config = DATABASE.defaultConfig()
@@ -800,7 +822,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         // ---------------------------------------------------------------------------------------------------------------
         // Testing.Debug.enable();
         int numCreateDatabase = 1;
-        int numCreateTables = 9; // still read DDL for all tables
+        int numCreateTables = 10; // still read DDL for all tables
         int numDataRecords = 1;
         SourceRecords records = consumeRecordsByTopic(numCreateDatabase + numCreateTables + numDataRecords);
         stopConnector();
@@ -841,7 +863,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         // ---------------------------------------------------------------------------------------------------------------
         // Testing.Debug.enable();
         int numCreateDatabase = 1;
-        int numCreateTables = 9; // still read DDL for all tables
+        int numCreateTables = 10; // still read DDL for all tables
         int numDataRecords = 1;
         SourceRecords records = consumeRecordsByTopic(numCreateDatabase + numCreateTables + numDataRecords);
         stopConnector();
@@ -870,6 +892,7 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
         config = DATABASE.defaultConfig()
                               .with(MySqlConnectorConfig.TABLE_WHITELIST, DATABASE.qualifiedTableName("dbz_147_decimalvalues"))
                               .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, true)
+                              .with(DatabaseHistory.STORE_ONLY_MONITORED_TABLES_DDL, true)
                               .with(MySqlConnectorConfig.DECIMAL_HANDLING_MODE, DecimalHandlingMode.STRING)
                               .build();
         // Start the connector ...
@@ -897,46 +920,6 @@ public class MySqlConnectorRegressionIT extends AbstractConnectorTest {
                 Object decimalValue = after.get("decimal_value");
                 assertThat(decimalValue).isInstanceOf(String.class);
                 assertThat(decimalValue).isEqualTo("12345.67");
-            }
-        });
-    }
-    @Test
-    @FixFor("DBZ-342")
-    public void shouldReturnTimeColumnsAsMilliSecondsInAdaptivePrecisionMode() throws SQLException, InterruptedException {
-        // Use the DB configuration to define the connector's configuration ...
-        config = DATABASE.defaultConfig()
-                .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, true)
-                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NEVER)
-                .with(MySqlConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ADAPTIVE)
-                .build();
-        // Start the connector ...
-        start(MySqlConnector.class, config);
-
-        // ---------------------------------------------------------------------------------------------------------------
-        // Consume all of the events due to startup and initialization of the database
-        // ---------------------------------------------------------------------------------------------------------------
-        // Testing.Debug.enable();
-        int numCreateDatabase = 1;
-        int numCreateTables = 11;
-        int numDataRecords = 20;
-        int numCreateDefiner = 1;
-        SourceRecords records =
-            consumeRecordsByTopic(numCreateDatabase + numCreateTables + numDataRecords + numCreateDefiner);
-        stopConnector();
-        assertThat(records).isNotNull();
-        assertThat(records.recordsForTopic(DATABASE.getServerName()).size()).isEqualTo(numCreateDatabase + numCreateTables + numCreateDefiner);
-        assertThat(records.recordsForTopic(DATABASE.topicForTable("dbz_85_fractest")).size()).isEqualTo(1);
-
-        records.forEach(this::validate);
-        records.forEach(record -> {
-            Struct value = (Struct) record.value();
-            if (record.topic().endsWith("dbz_85_fractest")) {
-                Struct after = value.getStruct(Envelope.FieldName.AFTER);
-                // c2 TIME(2),
-                // { "c2" : "17:51:04.777" }
-                Integer c2 = after.getInt32("c2");
-                long expectedMillis = Duration.ofHours(17).plusMinutes(51).plusSeconds(4).plusMillis(780).toMillis();
-                assertThat(c2).isEqualTo((int) expectedMillis);
             }
         });
     }

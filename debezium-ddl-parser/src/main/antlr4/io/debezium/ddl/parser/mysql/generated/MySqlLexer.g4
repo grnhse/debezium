@@ -1106,7 +1106,7 @@ FILESIZE_LITERAL:                    DEC_DIGIT+ ('K'|'M'|'G'|'T');
 
 
 START_NATIONAL_STRING_LITERAL:       'N' SQUOTA_STRING;
-STRING_LITERAL:                      DQUOTA_STRING | SQUOTA_STRING;
+STRING_LITERAL:                      SQUOTA_STRING | DQUOTA_STRING | BQUOTA_STRING;
 DECIMAL_LITERAL:                     DEC_DIGIT+;
 HEXADECIMAL_LITERAL:                 'X' '\'' (HEX_DIGIT HEX_DIGIT)+ '\''
                                      | '0X' HEX_DIGIT+;
@@ -1167,9 +1167,9 @@ fragment CHARSET_NAME:               ARMSCII8 | ASCII | BIG5 | BINARY | CP1250
                                      | LATIN1 | LATIN2 | LATIN5 | LATIN7
                                      | MACCE | MACROMAN | SJIS | SWE7 | TIS620
                                      | UCS2 | UJIS | UTF16 | UTF16LE | UTF32
-                                     | UTF8 | UTF8MB4;
+                                     | UTF8 | UTF8MB3 | UTF8MB4;
 
-fragment EXPONENT_NUM_PART:          'E' [\-+]? DEC_DIGIT+;
+fragment EXPONENT_NUM_PART:          'E' [-+]? DEC_DIGIT+;
 fragment ID_LITERAL:                 [A-Z_$0-9]*?[A-Z_$]+?[A-Z_$0-9]*;
 fragment DQUOTA_STRING:              '"' ( '\\'. | '""' | ~('"'| '\\') )* '"';
 fragment SQUOTA_STRING:              '\'' ('\\'. | '\'\'' | ~('\'' | '\\'))* '\'';

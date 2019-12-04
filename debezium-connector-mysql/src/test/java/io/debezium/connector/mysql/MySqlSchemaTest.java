@@ -11,11 +11,13 @@ import static org.junit.Assert.fail;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.util.Set;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.Configuration;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
@@ -42,7 +44,9 @@ public class MySqlSchemaTest {
         Testing.Files.delete(TEST_FILE_PATH);
         build = new Configurator();
         mysql = null;
-        source = new SourceInfo();
+        source = new SourceInfo(new MySqlConnectorConfig(Configuration.create()
+                .with(MySqlConnectorConfig.SERVER_NAME, "server")
+                .build()));
     }
 
     @After
@@ -216,8 +220,8 @@ public class MySqlSchemaTest {
         }
     }
 
-    protected void printStatements(String dbName, String ddlStatements) {
-        Testing.print("Running DDL for '" + dbName + "': " + ddlStatements);
+    protected void printStatements(String dbName, Set<TableId> tables, String ddlStatements) {
+        Testing.print("Running DDL for '" + dbName + "': " + ddlStatements + " changing tables '" + tables + "'");
     }
 
     protected String readFile(String classpathResource) {

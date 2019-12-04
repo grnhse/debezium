@@ -9,6 +9,9 @@ package io.debezium.connector.postgresql;
 import java.sql.SQLException;
 import java.util.Collections;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import io.debezium.annotation.ThreadSafe;
 import io.debezium.connector.common.CdcSourceTaskContext;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
@@ -18,8 +21,6 @@ import io.debezium.relational.TableId;
 import io.debezium.schema.TopicSelector;
 import io.debezium.util.Clock;
 import io.debezium.util.ElapsedTimeStrategy;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * The context of a {@link PostgresConnectorTask}. This deals with most of the brunt of reading various configuration options
@@ -40,7 +41,7 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
     private Long lastXmin;
 
     protected PostgresTaskContext(PostgresConnectorConfig config, PostgresSchema schema, TopicSelector<TableId> topicSelector) {
-        super("Postgres", config.getLogicalName(), Collections::emptySet);
+        super(config.getContextName(), config.getLogicalName(), Collections::emptySet);
 
         this.config = config;
         if (config.xminFetchInterval().toMillis() > 0) {
@@ -63,13 +64,11 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
         return config;
     }
 
-    protected void refreshSchema(boolean printReplicaIdentityInfo) throws SQLException {
-        try (final PostgresConnection connection = createConnection()) {
-            schema.refresh(connection, printReplicaIdentityInfo);
-        }
+    protected void refreshSchema(PostgresConnection connection, boolean printReplicaIdentityInfo) throws SQLException {
+        schema.refresh(connection, printReplicaIdentityInfo);
     }
 
-    protected Long getSlotXmin() throws SQLException {
+    Long getSlotXmin(PostgresConnection connection) throws SQLException {
         // when xmin fetch is set to 0, we don't track it to ignore any performance of querying the
         // slot periodically
         if (config.xminFetchInterval().toMillis() <= 0) {
@@ -78,7 +77,7 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
         assert(this.refreshXmin != null);
 
         if (this.refreshXmin.hasElapsed()) {
-            lastXmin = getCurrentSlotInfo().slotCatalogXmin();
+            lastXmin = getCurrentSlotState(connection).slotCatalogXmin();
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("Fetched new xmin from slot of {}", lastXmin);
             }
@@ -92,22 +91,21 @@ public class PostgresTaskContext extends CdcSourceTaskContext {
         return lastXmin;
     }
 
-    protected SlotState getCurrentSlotInfo() throws SQLException {
-        SlotState slotInfo;
-        try (final PostgresConnection connection = createConnection()) {
-            slotInfo = connection.getReplicationSlotInfo(config.slotName(), config.plugin().getPostgresPluginName());
-        }
-        return slotInfo;
+    private SlotState getCurrentSlotState(PostgresConnection connection) throws SQLException {
+        return connection.getReplicationSlotState(config.slotName(), config.plugin().getPostgresPluginName());
     }
 
-    protected ReplicationConnection createReplicationConnection() throws SQLException {
+    protected ReplicationConnection createReplicationConnection(boolean exportSnapshot) throws SQLException {
         return ReplicationConnection.builder(config.jdbcConfig())
                                     .withSlot(config.slotName())
+                                    .withPublication(config.publicationName())
                                     .withPlugin(config.plugin())
                                     .dropSlotOnClose(config.dropSlotOnStop())
                                     .streamParams(config.streamParams())
                                     .statusUpdateInterval(config.statusUpdateInterval())
                                     .withTypeRegistry(schema.getTypeRegistry())
+                                    .exportSnapshotOnCreate(exportSnapshot)
+                                    .withSchema(schema)
                                     .build();
     }
 

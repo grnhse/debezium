@@ -5,6 +5,7 @@
  */
 package io.debezium.connector.mysql;
 
+import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -14,16 +15,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 
-import io.debezium.config.Configuration;
-import org.apache.avro.Schema;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.fest.assertions.GenericAssert;
 import org.junit.Before;
 import org.junit.Test;
 
-import static org.fest.assertions.Assertions.assertThat;
-
 import io.confluent.connect.avro.AvroData;
+import io.debezium.config.Configuration;
+import io.debezium.connector.AbstractSourceInfoStructMaker;
+import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
 import io.debezium.document.Document;
 
@@ -42,7 +44,9 @@ public class SourceInfoTest {
 
     @Before
     public void beforeEach() {
-        source = new SourceInfo();
+        source = new SourceInfo(new MySqlConnectorConfig(Configuration.create()
+                .with(MySqlConnectorConfig.SERVER_NAME, "server")
+                .build()));
         inTxn = false;
         positionOfBeginEvent = 0L;
         eventNumberInTxn = 0;
@@ -473,9 +477,11 @@ public class SourceInfoTest {
     }
 
     protected SourceInfo sourceWith(Map<String, String> offset) {
-        source = new SourceInfo();
+        source = new SourceInfo(new MySqlConnectorConfig(Configuration.create()
+                .with(MySqlConnectorConfig.SERVER_NAME, SERVER_NAME)
+                .build()));
+        source.databaseEvent("mysql");
         source.setOffset(offset);
-        source.setServerName(SERVER_NAME);
         return source;
     }
 
@@ -485,8 +491,8 @@ public class SourceInfoTest {
      */
     @Test
     public void shouldValidateSourceInfoSchema() {
-        org.apache.kafka.connect.data.Schema kafkaSchema = SourceInfo.SCHEMA;
-        Schema avroSchema = avroData.fromConnectSchema(kafkaSchema);
+        org.apache.kafka.connect.data.Schema kafkaSchema = source.schema();
+        org.apache.avro.Schema avroSchema = avroData.fromConnectSchema(kafkaSchema);
         assertTrue(avroSchema != null);
     }
 
@@ -616,15 +622,47 @@ public class SourceInfoTest {
     }
 
     @Test
+    public void shouldHaveTimestamp() {
+        sourceWith(offset(100, 5, true));
+        source.setBinlogTimestampSeconds(1_024);
+        source.databaseEvent("mysql");
+        assertThat(source.struct().get("ts_ms")).isEqualTo(1_024_000L);
+    }
+
+    @Test
     public void versionIsPresent() {
         sourceWith(offset(100, 5, true));
+        source.databaseEvent("mysql");
         assertThat(source.struct().getString(SourceInfo.DEBEZIUM_VERSION_KEY)).isEqualTo(Module.version());
     }
 
     @Test
     public void connectorIsPresent() {
         sourceWith(offset(100, 5, true));
+        source.databaseEvent("mysql");
         assertThat(source.struct().getString(SourceInfo.DEBEZIUM_CONNECTOR_KEY)).isEqualTo(Module.name());
+    }
+
+    @Test
+    public void schemaIsCorrect() {
+        final Schema schema = SchemaBuilder.struct()
+                .name("io.debezium.connector.mysql.Source")
+                .field("version", Schema.STRING_SCHEMA)
+                .field("connector", Schema.STRING_SCHEMA)
+                .field("name", Schema.STRING_SCHEMA)
+                .field("ts_ms", Schema.INT64_SCHEMA)
+                .field("snapshot", AbstractSourceInfoStructMaker.SNAPSHOT_RECORD_SCHEMA)
+                .field("db", Schema.STRING_SCHEMA)
+                .field("table", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("server_id", Schema.INT64_SCHEMA)
+                .field("gtid", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("file", Schema.STRING_SCHEMA)
+                .field("pos", Schema.INT64_SCHEMA)
+                .field("row", Schema.INT32_SCHEMA)
+                .field("thread", Schema.OPTIONAL_INT64_SCHEMA)
+                .field("query", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        VerifyRecord.assertConnectSchemasAreEqual(null, source.schema(), schema);
     }
 
     protected Document positionWithGtids(String gtids) {

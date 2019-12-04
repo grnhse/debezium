@@ -26,6 +26,7 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig.Version;
 import io.debezium.config.Configuration;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotIsolationMode;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig.SnapshotMode;
@@ -86,6 +87,7 @@ public class SnapshotIT extends AbstractConnectorTest {
 
     @Test
     public void takeSnapshotInSnapshotMode() throws Exception {
+        Testing.Print.enable();
         takeSnapshot(SnapshotIsolationMode.SNAPSHOT);
     }
 
@@ -143,8 +145,30 @@ public class SnapshotIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         // Ignore initial records
-        consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
+        final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
+        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
+        table1.subList(0, INITIAL_RECORDS_PER_TABLE - 1).forEach(record -> {
+            assertThat(((Struct) record.value()).getStruct("source").getString("snapshot")).isEqualTo("true");
+        });
+        assertThat(((Struct) table1.get(INITIAL_RECORDS_PER_TABLE - 1).value()).getStruct("source").getString("snapshot")).isEqualTo("last");
+        testStreaming();
+    }
 
+    @Test
+    public void takeSnapshotWithOldStructAndStartStreaming() throws Exception {
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SOURCE_STRUCT_MAKER_VERSION, Version.V1)
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+
+        // Ignore initial records
+        final SourceRecords records = consumeRecordsByTopic(INITIAL_RECORDS_PER_TABLE);
+        final List<SourceRecord> table1 = records.recordsForTopic("server1.dbo.table1");
+        table1.forEach(record -> {
+            assertThat(((Struct) record.value()).getStruct("source").getBoolean("snapshot")).isTrue();
+        });
         testStreaming();
     }
 
@@ -178,10 +202,11 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).hasSize(2);
+            assertThat(record1.sourceOffset()).hasSize(3);
 
             Assert.assertTrue(record1.sourceOffset().containsKey("change_lsn"));
             Assert.assertTrue(record1.sourceOffset().containsKey("commit_lsn"));
+            Assert.assertTrue(record1.sourceOffset().containsKey("event_serial_no"));
             assertNull(value1.get("before"));
         }
     }
@@ -323,6 +348,127 @@ public class SnapshotIT extends AbstractConnectorTest {
 
         stopConnector();
     }
+    
+    @Test
+    public void reoderCapturedTables() throws Exception {
+        connection.execute(
+                "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_b (id int, name varchar(30), amount integer primary key(id))"
+        );
+        connection.execute("INSERT INTO table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO table_b VALUES(11, 'some_name', 447)");
+        TestHelper.enableTableCdc(connection, "table_a");
+        TestHelper.enableTableCdc(connection, "table_b");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.table_b,dbo.table_a")
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+        
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_b");
+        
+        Assertions.assertThat(tableB).hasSize(1);
+        Assertions.assertThat(tableA).isNull();
+        
+        records = consumeRecordsByTopic(1);
+        tableA = records.recordsForTopic("server1.dbo.table_a");
+        Assertions.assertThat(tableA).hasSize(1);
+        
+        stopConnector();
+    }
+    
+    @Test
+    public void reoderCapturedTablesWithOverlappingTableWhitelist() throws Exception {
+        connection.execute(
+                "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_ac (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_ab (id int, name varchar(30), amount integer primary key(id))"
+        );
+        connection.execute("INSERT INTO table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO table_ab VALUES(11, 'some_name', 447)");
+        connection.execute("INSERT INTO table_ac VALUES(12, 'some_name', 885)");
+        TestHelper.enableTableCdc(connection, "table_a");
+        TestHelper.enableTableCdc(connection, "table_ab");
+        TestHelper.enableTableCdc(connection, "table_ac");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(SqlServerConnectorConfig.TABLE_WHITELIST, "dbo.table_ab,dbo.table_(.*)")
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+        
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_ab");
+        List<SourceRecord> tableC = records.recordsForTopic("server1.dbo.table_ac");
+        
+        Assertions.assertThat(tableB).hasSize(1);
+        Assertions.assertThat(tableA).isNull();
+        Assertions.assertThat(tableC).isNull();
+        
+        records = consumeRecordsByTopic(1);
+        tableA = records.recordsForTopic("server1.dbo.table_a");
+        Assertions.assertThat(tableA).hasSize(1);
+        Assertions.assertThat(tableC).isNull();
+        
+        records = consumeRecordsByTopic(1);
+        tableC = records.recordsForTopic("server1.dbo.table_ac");
+        Assertions.assertThat(tableC).hasSize(1);
+        
+        stopConnector();
+    }
+    
+    @Test
+    public void reoderCapturedTablesWithoutTableWhitelist() throws Exception {
+        connection.execute(
+                "CREATE TABLE table_ac (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_a (id int, name varchar(30), amount integer primary key(id))",
+                "CREATE TABLE table_ab (id int, name varchar(30), amount integer primary key(id))"
+                );
+        connection.execute("INSERT INTO table_ac VALUES(12, 'some_name', 885)");
+        connection.execute("INSERT INTO table_a VALUES(10, 'some_name', 120)");
+        connection.execute("INSERT INTO table_ab VALUES(11, 'some_name', 447)");
+        TestHelper.enableTableCdc(connection, "table_a");
+        TestHelper.enableTableCdc(connection, "table_ab");
+        TestHelper.enableTableCdc(connection, "table_ac");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.INITIAL)
+                .with(SqlServerConnectorConfig.TABLE_BLACKLIST, "dbo.table1")
+                
+                .build();
+
+        start(SqlServerConnector.class, config);
+        assertConnectorIsRunning();
+        
+        SourceRecords records = consumeRecordsByTopic(1);
+        List<SourceRecord> tableA = records.recordsForTopic("server1.dbo.table_a");
+        List<SourceRecord> tableB = records.recordsForTopic("server1.dbo.table_ab");
+        List<SourceRecord> tableC = records.recordsForTopic("server1.dbo.table_ac");
+        
+        Assertions.assertThat(tableA).hasSize(1);
+        Assertions.assertThat(tableB).isNull();
+        Assertions.assertThat(tableC).isNull();
+        
+        records = consumeRecordsByTopic(1);
+        tableB = records.recordsForTopic("server1.dbo.table_ab");
+        Assertions.assertThat(tableB).hasSize(1);
+        Assertions.assertThat(tableC).isNull();
+        
+        records = consumeRecordsByTopic(1);
+        tableC = records.recordsForTopic("server1.dbo.table_ac");
+        Assertions.assertThat(tableC).hasSize(1);
+        
+        stopConnector();
+    }
+    
 
     private void assertRecord(Struct record, List<SchemaAndValueField> expected) {
         expected.forEach(schemaAndValueField -> schemaAndValueField.assertFor(record));

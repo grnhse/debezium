@@ -9,13 +9,13 @@ package io.debezium.connector.postgresql.connection.pgproto;
 import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -26,9 +26,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.postgresql.PgOid;
+import io.debezium.connector.postgresql.PostgresStreamingChangeEventSource.PgConnectionSupplier;
 import io.debezium.connector.postgresql.PostgresType;
 import io.debezium.connector.postgresql.PostgresValueConverter;
-import io.debezium.connector.postgresql.RecordsStreamProducer.PgConnectionSupplier;
+import io.debezium.connector.postgresql.UnchangedToastedReplicationMessageColumn;
 import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.connector.postgresql.connection.AbstractReplicationMessageColumn;
 import io.debezium.connector.postgresql.connection.ReplicationMessage;
@@ -106,6 +107,9 @@ class PgProtoReplicationMessage implements ReplicationMessage {
                     final Optional<PgProto.TypeInfo> typeInfo = Optional.ofNullable(hasTypeMetadata() && typeInfoList != null ? typeInfoList.get(index) : null);
                     final String columnName = Strings.unquoteIdentifierPart(datum.getColumnName());
                     final PostgresType type = typeRegistry.get((int) datum.getColumnType());
+                    if (datum.hasDatumMissing()) {
+                        return new UnchangedToastedReplicationMessageColumn(columnName, type, typeInfo.map(PgProto.TypeInfo::getModifier).orElse(null), typeInfo.map(PgProto.TypeInfo::getValueOptional).orElse(Boolean.FALSE), hasTypeMetadata());
+                    }
                     return new AbstractReplicationMessageColumn(columnName, type, typeInfo.map(PgProto.TypeInfo::getModifier).orElse(null), typeInfo.map(PgProto.TypeInfo::getValueOptional).orElse(Boolean.FALSE), hasTypeMetadata()) {
 
                         @Override
@@ -140,6 +144,10 @@ class PgProtoReplicationMessage implements ReplicationMessage {
      * @return the value; may be null
      */
     public Object getValue(PgProto.DatumMessage datumMessage, PgConnectionSupplier connection, boolean includeUnknownDatatypes) {
+        if (datumMessage.hasDatumMissing()) {
+            return UnchangedToastedReplicationMessageColumn.UNCHANGED_TOAST_VALUE;
+        }
+
         int columnType = (int) datumMessage.getColumnType();
         switch (columnType) {
             case PgOid.BOOL:
@@ -187,23 +195,28 @@ class PgProtoReplicationMessage implements ReplicationMessage {
                     return null;
                 }
                 // these types are sent by the plugin as LONG - microseconds since Unix Epoch
-                // but we'll convert them to nanos which is the smallest unit
-                final LocalDateTime serverLocal = Conversions.toLocalDateTimeUTC(datumMessage.getDatumInt64());
-                return Conversions.toEpochNanos(serverLocal.toInstant(ZoneOffset.UTC));
+                return Conversions.toInstantFromMicros(datumMessage.getDatumInt64());
             case PgOid.TIMESTAMPTZ:
-            case PgOid.TIME:
                 if (!datumMessage.hasDatumInt64()) {
                     return null;
                 }
                 // these types are sent by the plugin as LONG - microseconds since Unix Epoch
-                // but we'll convert them to nanos which is the smallest unit
-                return TimeUnit.NANOSECONDS.convert(datumMessage.getDatumInt64(), TimeUnit.MICROSECONDS);
+                return Conversions.toInstantFromMicros(datumMessage.getDatumInt64()).atOffset(ZoneOffset.UTC);
+            case PgOid.TIME:
+                if (!datumMessage.hasDatumInt64()) {
+                    return null;
+                }
+
+                // these types are sent by the plugin as LONG - microseconds since Unix Epoch
+                return Duration.of(datumMessage.getDatumInt64(), ChronoUnit.MICROS);
             case PgOid.TIMETZ:
                 if (!datumMessage.hasDatumDouble()) {
                     return null;
                 }
-                // the value is sent as a double microseconds, convert to nano
-                return BigDecimal.valueOf(datumMessage.getDatumDouble() * 1000).longValue();
+                // the value is sent as a double microseconds
+                return Conversions.toInstantFromMicros((long) datumMessage.getDatumDouble())
+                        .atOffset(ZoneOffset.UTC)
+                        .toOffsetTime();
             case PgOid.INTERVAL:
                 // these are sent as doubles by the plugin since their storage is larger than 8 bytes
                 return datumMessage.hasDatumDouble() ? datumMessage.getDatumDouble() : null;
@@ -272,7 +285,10 @@ class PgProtoReplicationMessage implements ReplicationMessage {
                 if(type.getOid() == typeRegistry.hstoreOid()) {
                     return datumMessage.getDatumBytes().toByteArray();
                 }
-                if (type.getOid() == typeRegistry.geometryArrayOid() || type.getOid() == typeRegistry.geographyArrayOid() || type.getOid() == typeRegistry.citextArrayOid() ) {
+                if (type.getOid() == typeRegistry.geometryArrayOid() ||
+                        type.getOid() == typeRegistry.geographyArrayOid() ||
+                        type.getOid() == typeRegistry.citextArrayOid() ||
+                        type.getOid() == typeRegistry.hstoreArrayOid()) {
                     return getArray(datumMessage, connection, columnType);
                 }
                 // unknown data type is sent by decoder as binary value

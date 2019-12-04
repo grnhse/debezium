@@ -17,6 +17,9 @@ import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SourceInfoStructMaker;
+import io.debezium.heartbeat.Heartbeat;
 
 /**
  * The configuration properties.
@@ -318,14 +321,15 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
                                                      CommonConnectorConfig.TOMBSTONES_ON_DELETE,
                                                      CommonConnectorConfig.SNAPSHOT_DELAY_MS,
                                                      CommonConnectorConfig.SNAPSHOT_FETCH_SIZE,
-                                                     SNAPSHOT_MODE);
+                                                     SNAPSHOT_MODE, CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION,
+                                                     Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX);
 
     protected static Field.Set EXPOSED_FIELDS = ALL_FIELDS;
 
     private final SnapshotMode snapshotMode;
 
     public MongoDbConnectorConfig(Configuration config) {
-        super(config, config.getString(LOGICAL_NAME));
+        super(config, config.getString(LOGICAL_NAME), DEFAULT_SNAPSHOT_FETCH_SIZE);
 
         String snapshotModeValue = config.getString(MongoDbConnectorConfig.SNAPSHOT_MODE);
         this.snapshotMode = SnapshotMode.parse(snapshotModeValue, MongoDbConnectorConfig.SNAPSHOT_MODE.defaultValueAsString());
@@ -336,7 +340,8 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         Field.group(config, "MongoDB", HOSTS, USER, PASSWORD, LOGICAL_NAME, CONNECT_BACKOFF_INITIAL_DELAY_MS,
                     CONNECT_BACKOFF_MAX_DELAY_MS, MAX_FAILED_CONNECTIONS, AUTO_DISCOVER_MEMBERS,
                     SSL_ENABLED, SSL_ALLOW_INVALID_HOSTNAMES);
-        Field.group(config, "Events", DATABASE_WHITELIST, DATABASE_BLACKLIST, COLLECTION_WHITELIST, COLLECTION_BLACKLIST, FIELD_BLACKLIST, FIELD_RENAMES, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
+        Field.group(config, "Events", DATABASE_WHITELIST, DATABASE_BLACKLIST, COLLECTION_WHITELIST, COLLECTION_BLACKLIST, FIELD_BLACKLIST, FIELD_RENAMES, CommonConnectorConfig.TOMBSTONES_ON_DELETE,
+                CommonConnectorConfig.SOURCE_STRUCT_MAKER_VERSION, Heartbeat.HEARTBEAT_INTERVAL, Heartbeat.HEARTBEAT_TOPICS_PREFIX);
         Field.group(config, "Connector", MAX_COPY_THREADS, CommonConnectorConfig.MAX_QUEUE_SIZE,
                 CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.POLL_INTERVAL_MS,
                 CommonConnectorConfig.SNAPSHOT_DELAY_MS, CommonConnectorConfig.SNAPSHOT_FETCH_SIZE, SNAPSHOT_MODE);
@@ -375,19 +380,22 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         return 0;
     }
 
-    /**
-     * Returns the number of documents to return per fetch by default. Default to {@code 0}, which indicates
-     * that the server chooses an appropriate fetch size.
-     *
-     * @param config configuration
-     * @return the default fetch size
-     */
-    @Override
-    protected int defaultSnapshotFetchSize(Configuration config) {
-        return DEFAULT_SNAPSHOT_FETCH_SIZE;
-    }
-
     public SnapshotMode getSnapshotMode() {
         return snapshotMode;
+    }
+
+    @Override
+    protected SourceInfoStructMaker<? extends AbstractSourceInfo> getSourceInfoStructMaker(Version version) {
+        switch (version) {
+        case V1:
+            return new LegacyV1MongoDbSourceInfoStructMaker(Module.name(), Module.version(), this);
+        default:
+            return new MongoDbSourceInfoStructMaker(Module.name(), Module.version(), this);
+        }
+    }
+
+    @Override
+    public String getContextName() {
+        return Module.contextName();
     }
 }

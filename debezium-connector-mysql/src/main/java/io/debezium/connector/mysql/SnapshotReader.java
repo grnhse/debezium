@@ -14,7 +14,6 @@ import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Calendar;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -29,10 +28,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 
+import io.debezium.connector.SnapshotRecord;
 import io.debezium.connector.mysql.RecordMakers.RecordsForTable;
+import io.debezium.data.Envelope;
 import io.debezium.function.BufferedBlockingConsumer;
 import io.debezium.function.Predicates;
 import io.debezium.heartbeat.Heartbeat;
@@ -128,15 +130,18 @@ public class SnapshotReader extends AbstractReader {
         logger.debug("Completed writing all snapshot records");
     }
 
-    protected Object readField(ResultSet rs, int fieldNo, Column actualColumn) throws SQLException {
-        if(actualColumn.jdbcType() == Types.TIME) {
+    protected Object readField(ResultSet rs, int fieldNo, Column actualColumn, Table actualTable) throws SQLException {
+        if (actualColumn.jdbcType() == Types.TIME) {
             return readTimeField(rs, fieldNo);
+        }
+        else if (actualColumn.jdbcType() == Types.DATE) {
+            return readDateField(rs, fieldNo, actualColumn, actualTable);
         }
         // This is for DATETIME columns (a logical date + time without time zone)
         // by reading them with a calendar based on the default time zone, we make sure that the value
         // is constructed correctly using the database's (or connection's) time zone
         else if (actualColumn.jdbcType() == Types.TIMESTAMP) {
-            return rs.getTimestamp(fieldNo, Calendar.getInstance());
+            return readTimestampField(rs, fieldNo, actualColumn, actualTable);
         }
         else {
             return rs.getObject(fieldNo);
@@ -156,7 +161,48 @@ public class SnapshotReader extends AbstractReader {
 
         try {
             return MySqlValueConverters.stringToDuration(new String(b.getBytes(1, (int) (b.length())), "UTF-8"));
-        } catch (UnsupportedEncodingException e) {
+        }
+        catch (UnsupportedEncodingException e) {
+            logger.error("Could not read MySQL TIME value as UTF-8");
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * In non-string mode the date field can contain zero in any of the date part which we need to handle as all-zero
+     *
+     */
+    private Object readDateField(ResultSet rs, int fieldNo, Column column, Table table) throws SQLException {
+        Blob b = rs.getBlob(fieldNo);
+        if (b == null) {
+            return null; // Don't continue parsing date field if it is null
+        }
+
+        try {
+            return MySqlValueConverters.stringToLocalDate(new String(b.getBytes(1, (int) (b.length())), "UTF-8"), column, table);
+        }
+        catch (UnsupportedEncodingException e) {
+            logger.error("Could not read MySQL TIME value as UTF-8");
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * In non-string mode the time field can contain zero in any of the date part which we need to handle as all-zero
+     *
+     */
+    private Object readTimestampField(ResultSet rs, int fieldNo, Column column, Table table) throws SQLException {
+        Blob b = rs.getBlob(fieldNo);
+        if (b == null) {
+            return null; // Don't continue parsing timestamp field if it is null
+        }
+
+        try {
+            return MySqlValueConverters.containsZeroValuesInDatePart((new String(b.getBytes(1, (int) (b.length())), "UTF-8")), column, table) ?
+                    null :
+                    rs.getTimestamp(fieldNo, Calendar.getInstance());
+        }
+        catch (UnsupportedEncodingException e) {
             logger.error("Could not read MySQL TIME value as UTF-8");
             throw new RuntimeException(e);
         }
@@ -289,8 +335,8 @@ public class SnapshotReader extends AbstractReader {
                     return;
                 }
                 logger.info("Step {}: read list of available tables in each database", step++);
-                List<TableId> tableIds = new ArrayList<>();
-                //List<TableId> allTableIds = new ArrayList<>();
+                List<TableId> knownTableIds = new ArrayList<>();
+                final List<TableId> capturedTableIds = new ArrayList<>();
                 final Filters createTableFilters = getCreateTableFilters(filters);
                 final Map<String, List<TableId>> createTablesMap = new HashMap<>();
                 final Set<String> readableDatabaseNames = new HashSet<>();
@@ -302,14 +348,22 @@ public class SnapshotReader extends AbstractReader {
                         mysql.query(sql.get(), rs -> {
                             while (rs.next() && isRunning()) {
                                 TableId id = new TableId(dbName, null, rs.getString(1));
-                                if (createTableFilters.tableFilter().test(id)) {
+                                final boolean shouldRecordTableSchema = shouldRecordTableSchema(schema, filters, id);
+                                // Apply only when the whitelist table list is not dynamically reconfigured
+                                if ((createTableFilters == filters && shouldRecordTableSchema) || createTableFilters.tableFilter().test(id)) {
                                     createTablesMap.computeIfAbsent(dbName, k -> new ArrayList<>()).add(id);
                                 }
-                                if (filters.tableFilter().test(id)) {
-                                    tableIds.add(id);
-                                    logger.info("\t including '{}'", id);
+                                if (shouldRecordTableSchema) {
+                                    knownTableIds.add(id);
+                                    logger.info("\t including '{}' among known tables", id);
                                 } else {
-                                    logger.info("\t '{}' is filtered out, discarding", id);
+                                    logger.info("\t '{}' is not added among known tables", id);
+                                }
+                                if (filters.tableFilter().test(id)) {
+                                    capturedTableIds.add(id);
+                                    logger.info("\t including '{}' for further processing", id);
+                                } else {
+                                    logger.info("\t '{}' is filtered out of capturing", id);
                                 }
                             }
                         });
@@ -325,7 +379,7 @@ public class SnapshotReader extends AbstractReader {
                 List<Pattern> tableWhitelistPattern = Strings.listOfRegex(context.config().getString(MySqlConnectorConfig.TABLE_WHITELIST), Pattern.CASE_INSENSITIVE);
                 List<TableId> tableIdsSorted = new ArrayList<>();
                 tableWhitelistPattern.forEach(pattern -> {
-                    List<TableId> tablesMatchedByPattern = tableIds.stream().filter(t -> pattern.asPredicate().test(t.toString()))
+                    List<TableId> tablesMatchedByPattern = capturedTableIds.stream().filter(t -> pattern.asPredicate().test(t.toString()))
                             .collect(Collectors.toList());
                                         tablesMatchedByPattern.forEach(t -> {
                                                 if (!tableIdsSorted.contains(t)) {
@@ -333,7 +387,7 @@ public class SnapshotReader extends AbstractReader {
                                                 }
                                         });
                 });
-                tableIds.sort(Comparator.comparing(tableIdsSorted::indexOf));
+                capturedTableIds.sort(Comparator.comparing(tableIdsSorted::indexOf));
                 final Set<String> includedDatabaseNames = readableDatabaseNames.stream().filter(filters.databaseFilter()).collect(Collectors.toSet());
                 logger.info("\tsnapshot continuing with database(s): {}", includedDatabaseNames);
 
@@ -351,8 +405,8 @@ public class SnapshotReader extends AbstractReader {
                                 + "consistent snapshot by preventing concurrent writes to tables.");
                         }
                         // We have the required privileges, so try to lock all of the tables we're interested in ...
-                        logger.info("Step {}: flush and obtain read lock for {} tables (preventing writes)", step++, tableIds.size());
-                        String tableList = tableIds.stream()
+                        logger.info("Step {}: flush and obtain read lock for {} tables (preventing writes)", step++, knownTableIds.size());
+                        String tableList = capturedTableIds.stream()
                             .map(tid -> quote(tid))
                             .reduce((r, element) -> r + "," + element)
                             .orElse(null);
@@ -384,9 +438,7 @@ public class SnapshotReader extends AbstractReader {
                     schema.applyDdl(source, null, setSystemVariablesStatement, this::enqueueSchemaChanges);
 
                     // Add DROP TABLE statements for all tables that we knew about AND those tables found in the databases ...
-                    List<TableId> allTableIds = new ArrayList<>(schema.tableIds());
-                    allTableIds.addAll(tableIds);
-                    allTableIds.stream()
+                    knownTableIds.stream()
                                .filter(id -> isRunning()) // ignore all subsequent tables if this reader is stopped
                                .forEach(tableId -> schema.applyDdl(source, tableId.schema(),
                                                                    "DROP TABLE IF EXISTS " + quote(tableId),
@@ -470,15 +522,15 @@ public class SnapshotReader extends AbstractReader {
                     BufferedBlockingConsumer<SourceRecord> bufferedRecordQueue = BufferedBlockingConsumer.bufferLast(super::enqueueRecord);
 
                     // Dump all of the tables and generate source records ...
-                    logger.info("Step {}: scanning contents of {} tables while still in transaction", step, tableIds.size());
-                    metrics.monitoredTablesDetermined(tableIds);
+                    logger.info("Step {}: scanning contents of {} tables while still in transaction", step, capturedTableIds.size());
+                    metrics.monitoredTablesDetermined(capturedTableIds);
 
                     long startScan = clock.currentTimeInMillis();
                     AtomicLong totalRowCount = new AtomicLong();
                     int counter = 0;
                     int completedCounter = 0;
                     long largeTableCount = context.rowCountForLargeTable();
-                    Iterator<TableId> tableIdIter = tableIds.iterator();
+                    Iterator<TableId> tableIdIter = capturedTableIds.iterator();
                     while (tableIdIter.hasNext()) {
                         TableId tableId = tableIdIter.next();
                         AtomicLong rowNum = new AtomicLong();
@@ -520,9 +572,9 @@ public class SnapshotReader extends AbstractReader {
 
                             // Scan the rows in the table ...
                             long start = clock.currentTimeInMillis();
-                            logger.info("Step {}: - scanning table '{}' ({} of {} tables)", step, tableId, ++counter, tableIds.size());
+                            logger.info("Step {}: - scanning table '{}' ({} of {} tables)", step, tableId, ++counter, capturedTableIds.size());
 
-                            Map<TableId, String> selectOverrides = getSnapshotSelectOverridesByTable();
+                            Map<TableId, String> selectOverrides = context.getConnectorConfig().getSnapshotSelectOverridesByTable();
 
                             String selectStatement = selectOverrides.getOrDefault(tableId, "SELECT * FROM " + quote(tableId));
                             logger.info("For table '{}' using select statement: '{}'", tableId, selectStatement);
@@ -540,7 +592,7 @@ public class SnapshotReader extends AbstractReader {
                                         while (rs.next()) {
                                             for (int i = 0, j = 1; i != numColumns; ++i, ++j) {
                                                 Column actualColumn = table.columns().get(i);
-                                                row[i] = readField(rs, j, actualColumn);
+                                                row[i] = readField(rs, j, actualColumn, table);
                                             }
                                             recorder.recordRow(recordMaker, row, ts); // has no row number!
                                             rowNum.incrementAndGet();
@@ -568,7 +620,7 @@ public class SnapshotReader extends AbstractReader {
                                             metrics.rowsScanned(tableId, rowNum.get());
                                         }
                                     } catch (InterruptedException e) {
-                                        Thread.interrupted();
+                                        Thread.currentThread().interrupt();
                                         // We were not able to finish all rows in all tables ...
                                         logger.info("Step {}: Stopping the snapshot due to thread interruption", stepNum);
                                         interrupted.set(true);
@@ -596,17 +648,17 @@ public class SnapshotReader extends AbstractReader {
                     source.markLastSnapshot(context.config());
                     long stop = clock.currentTimeInMillis();
                     try {
-                        bufferedRecordQueue.close(this::replaceOffset);
+                        bufferedRecordQueue.close(this::replaceOffsetAndSource);
                         if (logger.isInfoEnabled()) {
                             logger.info("Step {}: scanned {} rows in {} tables in {}",
-                                        step, totalRowCount, tableIds.size(), Strings.duration(stop - startScan));
+                                        step, totalRowCount, capturedTableIds.size(), Strings.duration(stop - startScan));
                         }
                     } catch (InterruptedException e) {
-                        Thread.interrupted();
+                        Thread.currentThread().interrupt();
                         // We were not able to finish all rows in all tables ...
                         if (logger.isInfoEnabled()) {
                             logger.info("Step {}: aborting the snapshot after {} rows in {} of {} tables {}",
-                                        step, totalRowCount, completedCounter, tableIds.size(), Strings.duration(stop - startScan));
+                                        step, totalRowCount, completedCounter, capturedTableIds.size(), Strings.duration(stop - startScan));
                         }
                         interrupted.set(true);
                     }
@@ -728,6 +780,10 @@ public class SnapshotReader extends AbstractReader {
                 logger.warn("Failed to close the connection properly", e);
             }
         }
+    }
+
+    private boolean shouldRecordTableSchema(final MySqlSchema schema, final Filters filters, TableId id) {
+        return !schema.isStoreOnlyMonitoredTablesDdl() || filters.tableFilter().test(id);
     }
 
     protected void readBinlogPosition(int step, SourceInfo source, JdbcConnection mysql, AtomicReference<String> sql) throws SQLException {
@@ -858,17 +914,22 @@ public class SnapshotReader extends AbstractReader {
     }
 
     /**
-     * Utility method to replace the offset in the given record with the latest. This is used on the last record produced
+     * Utility method to replace the offset and the source in the given record with the latest. This is used on the last record produced
      * during the snapshot.
      *
      * @param record the record
      * @return the updated record
      */
-    protected SourceRecord replaceOffset(SourceRecord record) {
+    protected SourceRecord replaceOffsetAndSource(SourceRecord record) {
         if (record == null) {
             return null;
         }
         Map<String, ?> newOffset = context.source().offset();
+        final Struct envelope = (Struct) record.value();
+        final Struct source = (Struct) envelope.get(Envelope.FieldName.SOURCE);
+        if (SnapshotRecord.fromSource(source) == SnapshotRecord.TRUE) {
+            SnapshotRecord.LAST.toSource(source);
+        }
         return new SourceRecord(record.sourcePartition(),
                 newOffset,
                 record.topic(),
@@ -879,11 +940,11 @@ public class SnapshotReader extends AbstractReader {
                 record.value());
     }
 
-    protected void enqueueSchemaChanges(String dbName, String ddlStatement) {
+    protected void enqueueSchemaChanges(String dbName, Set<TableId> tables, String ddlStatement) {
         if (!context.includeSchemaChangeRecords() || ddlStatement.length() == 0) {
             return;
         }
-        if (context.makeRecord().schemaChanges(dbName, ddlStatement, super::enqueueRecord) > 0) {
+        if (context.makeRecord().schemaChanges(dbName, tables, ddlStatement, super::enqueueRecord) > 0) {
             logger.info("\t{}", ddlStatement);
         }
     }
@@ -894,28 +955,6 @@ public class SnapshotReader extends AbstractReader {
 
     protected void recordRowAsInsert(RecordsForTable recordMaker, Object[] row, long ts) throws InterruptedException {
         recordMaker.create(row, ts);
-    }
-
-    /**
-     * Returns any SELECT overrides, if present.
-     */
-    private Map<TableId, String> getSnapshotSelectOverridesByTable() {
-        String tableList = context.getSnapshotSelectOverrides();
-
-        if (tableList == null) {
-            return Collections.emptyMap();
-        }
-
-        Map<TableId, String> snapshotSelectOverridesByTable = new HashMap<>();
-
-        for (String table : tableList.split(",")) {
-            snapshotSelectOverridesByTable.put(
-                TableId.parse(table),
-                context.config().getString(MySqlConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE + "." + table)
-            );
-        }
-
-        return snapshotSelectOverridesByTable;
     }
 
     protected static interface RecordRecorder {

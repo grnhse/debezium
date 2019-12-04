@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoField;
@@ -32,6 +33,8 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.github.shyiko.mysql.binlog.event.deserialization.AbstractRowsEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.json.JsonBinary;
@@ -43,6 +46,7 @@ import io.debezium.data.Json;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.relational.Column;
+import io.debezium.relational.Table;
 import io.debezium.relational.ValueConverter;
 import io.debezium.time.Year;
 import io.debezium.util.Strings;
@@ -64,10 +68,22 @@ import io.debezium.util.Strings;
 @Immutable
 public class MySqlValueConverters extends JdbcValueConverters {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(MySqlValueConverters.class);
+
     /**
      * Used to parse values of TIME columns. Format: 000:00:00.000000.
      */
     private static final Pattern TIME_FIELD_PATTERN = Pattern.compile("(\\-?[0-9]*):([0-9]*):([0-9]*)(\\.([0-9]*))?");
+
+    /**
+     * Used to parse values of DATE columns. Format: 000-00-00.
+     */
+    private static final Pattern DATE_FIELD_PATTERN = Pattern.compile("([0-9]*)-([0-9]*)-([0-9]*)");
+
+    /**
+     * Used to parse values of TIMESTAMP columns. Format: 000-00-00 00:00:00.000.
+     */
+    private static final Pattern TIMESTAMP_FIELD_PATTERN = Pattern.compile("([0-9]*)-([0-9]*)-([0-9]*) .*");
 
     /**
      * A utility method that adjusts <a href="https://dev.mysql.com/doc/refman/5.7/en/two-digit-years.html">ambiguous</a> 2-digit
@@ -788,5 +804,39 @@ public class MySqlValueConverters extends JdbcValueConverters {
                     .minusSeconds(seconds)
                     .minusNanos(nanoSeconds);
         }
+    }
+
+    public static LocalDate stringToLocalDate(String dateString, Column column, Table table) {
+        final Matcher matcher = DATE_FIELD_PATTERN.matcher(dateString);
+        if (!matcher.matches()) {
+            throw new RuntimeException("Unexpected format for DATE column: " + dateString);
+        }
+
+        final int year = Integer.parseInt(matcher.group(1));
+        final int month = Integer.parseInt(matcher.group(2));
+        final int day = Integer.parseInt(matcher.group(3));
+
+        if (year == 0 || month == 0 || day == 0) {
+            LOGGER.warn("Invalid value '{}' stored in column '{}' of table '{}' converted to empty value", dateString, column.name(), table.id());
+            return null;
+        }
+        return LocalDate.of(year, month, day);
+    }
+
+    public static boolean containsZeroValuesInDatePart(String timestampString, Column column, Table table) {
+        final Matcher matcher = TIMESTAMP_FIELD_PATTERN.matcher(timestampString);
+        if (!matcher.matches()) {
+            throw new RuntimeException("Unexpected format for DATE column: " + timestampString);
+        }
+
+        final int year = Integer.parseInt(matcher.group(1));
+        final int month = Integer.parseInt(matcher.group(2));
+        final int day = Integer.parseInt(matcher.group(3));
+
+        if (year == 0 || month == 0 || day == 0) {
+            LOGGER.warn("Invalid value '{}' stored in column '{}' of table '{}' converted to empty value", timestampString, column.name(), table.id());
+            return true;
+        }
+        return false;
     }
 }

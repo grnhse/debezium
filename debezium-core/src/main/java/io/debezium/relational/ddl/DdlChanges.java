@@ -9,8 +9,10 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Predicate;
 
 import io.debezium.annotation.NotThreadSafe;
+import io.debezium.relational.TableId;
 
 /**
  * A {@link DdlParserListener} that accumulates changes, allowing them to be consumed in the same order by database.
@@ -64,13 +66,21 @@ public class DdlChanges implements DdlParserListener {
      */
     public void groupStatementStringsByDatabase(DatabaseStatementStringConsumer consumer) {
         groupEventsByDatabase((DatabaseEventConsumer) (dbName, eventList) -> {
-            StringBuilder statements = new StringBuilder();
+            final StringBuilder statements = new StringBuilder();
+            final Set<TableId> tables = new HashSet<>();
             eventList.forEach(event->{
                 statements.append(event.statement());
                 statements.append(terminator);
+                addTable(tables, event);
             });
-            consumer.consume(dbName, statements.toString());
+            consumer.consume(dbName, tables, statements.toString());
         });
+    }
+
+    private void addTable(final Set<TableId> tables, Event event) {
+        if (event instanceof TableEvent) {
+            tables.add(((TableEvent) event).tableId());
+        }
     }
 
     /**
@@ -81,8 +91,12 @@ public class DdlChanges implements DdlParserListener {
     public void groupStatementsByDatabase(DatabaseStatementConsumer consumer) {
         groupEventsByDatabase((DatabaseEventConsumer) (dbName, eventList) -> {
             List<String> statements = new ArrayList<>();
-            eventList.forEach(event->statements.add(event.statement()));
-            consumer.consume(dbName, statements);
+            final Set<TableId> tables = new HashSet<>();
+            eventList.forEach(event-> {
+                statements.add(event.statement());
+                addTable(tables, event);
+            });
+            consumer.consume(dbName, tables, statements);
         });
     }
 
@@ -129,10 +143,12 @@ public class DdlChanges implements DdlParserListener {
             case CREATE_DATABASE:
             case ALTER_DATABASE:
             case DROP_DATABASE:
+            case USE_DATABASE:
                 DatabaseEvent dbEvent = (DatabaseEvent) event;
                 return dbEvent.databaseName();
             case SET_VARIABLE:
-                return "";
+                SetVariableEvent varEvent = (SetVariableEvent) event;
+                return varEvent.databaseName().orElse("");
         }
         assert false : "Should never happen";
         return null;
@@ -156,10 +172,29 @@ public class DdlChanges implements DdlParserListener {
     }
 
     public static interface DatabaseStatementConsumer {
-        void consume(String databaseName, List<String> ddlStatements);
+        void consume(String databaseName, Set<TableId> tableList, List<String> ddlStatements);
     }
 
     public static interface DatabaseStatementStringConsumer {
-        void consume(String databaseName, String ddlStatements);
+        void consume(String databaseName, Set<TableId> tableList, String ddlStatements);
+    }
+
+    /**
+     * @return true if any event stored is one of
+     * <ul>
+     * <li>database-wide events and affects whitelisted database</li>
+     * <li>table related events and the table is whitelisted</li>
+     * <li>events that set a variable and either affects whitelisted database or is a system-wide variable</li>
+     * <ul>
+     */
+    public boolean anyMatch(Predicate<String> databaseFilter, Predicate<TableId> tableFilter) {
+        return events.stream().anyMatch(event ->
+            (event instanceof DatabaseEvent) && databaseFilter.test(((DatabaseEvent) event).databaseName())
+            || (event instanceof TableEvent) && tableFilter.test(((TableEvent) event).tableId())
+            || (event instanceof SetVariableEvent) && (
+                    !((SetVariableEvent) event).databaseName().isPresent()
+                    || databaseFilter.test(((SetVariableEvent) event).databaseName().get())
+                )
+            );
     }
 }

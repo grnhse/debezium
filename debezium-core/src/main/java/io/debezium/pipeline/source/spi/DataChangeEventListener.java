@@ -29,9 +29,18 @@ public interface DataChangeEventListener {
      */
     void onFilteredEvent(String event);
 
+    /**
+     * Invoked for events that cannot be processed.
+     */
+    void onErroneousEvent(String event);
+
     static DataChangeEventListener NO_OP = new DataChangeEventListener() {
         @Override
         public void onFilteredEvent(String event) {
+        }
+
+        @Override
+        public void onErroneousEvent(String event) {
         }
 
         @Override

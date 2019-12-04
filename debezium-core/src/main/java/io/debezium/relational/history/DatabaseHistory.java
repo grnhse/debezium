@@ -63,7 +63,8 @@ public interface DatabaseHistory {
                                                     // Filter out RDS heartbeat statements, see DBZ-469
                                                     "INSERT INTO mysql.rds_heartbeat2\\(.*\\) values \\(.*\\) ON DUPLICATE KEY UPDATE value = .*," +
                                                     "FLUSH RELAY LOGS.*," +
-                                                    "flush relay logs.*"
+                                                    "flush relay logs.*," +
+                                                    "SAVEPOINT .*"
                                                  )
                                                 .withWidth(Width.LONG)
                                                 .withImportance(Importance.LOW)
@@ -78,8 +79,9 @@ public interface DatabaseHistory {
      * @param comparator the function that should be used to compare history records during
      *            {@link #recover(Map, Map, Tables, DdlParser) recovery}; may be null if the
      *            {@link HistoryRecordComparator#INSTANCE default comparator} is to be used
+     * @param listener TODO
      */
-    void configure(Configuration config, HistoryRecordComparator comparator);
+    void configure(Configuration config, HistoryRecordComparator comparator, DatabaseHistoryListener listener);
 
     /**
      * Start the history.
@@ -116,7 +118,7 @@ public interface DatabaseHistory {
     void recover(Map<String, ?> source, Map<String, ?> position, Tables schema, DdlParser ddlParser);
 
     /**
-     * Stop recording history and release any resources acquired since {@link #configure(Configuration, HistoryRecordComparator)}.
+     * Stop recording history and release any resources acquired since {@link #configure(Configuration, HistoryRecordComparator, DatabaseHistoryListener)}.
      */
     void stop();
 

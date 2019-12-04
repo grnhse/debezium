@@ -10,6 +10,7 @@ import java.io.PrintWriter;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.text.DecimalFormat;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -22,6 +23,7 @@ import java.util.StringTokenizer;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -40,6 +42,8 @@ import io.debezium.text.TokenStream.Tokens;
  */
 @ThreadSafe
 public final class Strings {
+
+    private static final Pattern TIME_PATTERN = Pattern.compile("([0-9]*):([0-9]*):([0-9]*)(\\.([0-9]*))?");
 
     /**
      * Generate the set of values that are included in the list.
@@ -683,6 +687,44 @@ public final class Strings {
     }
 
     /**
+     * Converts the given string (in the format 00:00:00(.0*)) into a {@link Duration}.
+     *
+     * @return the given value as {@code Duration} or {@code null} if {@code null} was passed.
+     */
+    public static Duration asDuration(String timeString) {
+        if (timeString == null) {
+            return null;
+        }
+        Matcher matcher = TIME_PATTERN.matcher(timeString);
+
+        if (!matcher.matches()) {
+            throw new RuntimeException("Unexpected format for TIME column: " + timeString);
+        }
+
+        long hours = Long.parseLong(matcher.group(1));
+        long minutes = Long.parseLong(matcher.group(2));
+        long seconds = Long.parseLong(matcher.group(3));
+        long nanoSeconds = 0;
+        String microSecondsString = matcher.group(5);
+        if (microSecondsString != null) {
+            nanoSeconds = Long.parseLong(Strings.justifyLeft(microSecondsString, 9, '0'));
+        }
+
+        if (hours >= 0) {
+            return Duration.ofHours(hours)
+                    .plusMinutes(minutes)
+                    .plusSeconds(seconds)
+                    .plusNanos(nanoSeconds);
+        }
+        else {
+            return Duration.ofHours(hours)
+                    .minusMinutes(minutes)
+                    .minusSeconds(seconds)
+                    .minusNanos(nanoSeconds);
+        }
+    }
+
+    /**
      * For the given duration in milliseconds, obtain a readable representation of the form {@code HHH:MM:SS.mmm}, where
      * <dl>
      * <dt>HHH</dt>
@@ -945,6 +987,37 @@ public final class Strings {
         }
 
         return bytes;
+    }
+
+    /**
+     * Whether the given string begins with the given prefix, ignoring casing.
+     * Copied from https://github.com/spring-projects/spring-framework/blob/master/spring-core/src/main/java/org/springframework/util/StringUtils.java.
+     */
+    public static boolean startsWithIgnoreCase(String str, String prefix) {
+        return (str != null && prefix != null && str.length() >= prefix.length() &&
+                str.regionMatches(true, 0, prefix, 0, prefix.length()));
+    }
+
+    /**
+     * Returns the first {@code length} characters of the given string.
+     *
+     * @param str    The string to get the begin from
+     * @param length The length of the string to return
+     * @return {@code null}, if the given string is {@code null}, the first first
+     *         {@code length} characters of that string otherwise. If the string is
+     *         shorter than the given number of characters, the string itself will
+     *         be returned.
+     */
+    public static String getBegin(String str, int length) {
+        if (str == null) {
+            return null;
+        }
+        else if (str.length() < length) {
+            return str;
+        }
+        else {
+            return str.substring(0, length);
+        }
     }
 
     private static Character deriveQuotingChar(String identifierPart) {
